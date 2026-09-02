@@ -45,10 +45,13 @@ fi
 # `NameError: name 'deep_gemm' is not defined`. Force the non-DeepGEMM branch.
 export SGLANG_OPT_DEEPGEMM_HC_PRENORM=0
 
-export NCCL_MIN_NCHANNELS=32
-export NCCL_P2P_DISABLE=1          # P2P is unavailable in hardware; don't let NCCL probe it
-export NCCL_SHM_DISABLE=0
-export SGLANG_DISABLE_CUSTOM_ALL_REDUCE=1
+# Deliberately NOT setting NCCL_P2P_DISABLE / NCCL_MIN_NCHANNELS. Measured on this
+# box (bench_allreduce.py, 8 GPUs): forcing them made every case worse than NCCL's
+# own defaults -- 8 KiB all-reduce 125 vs 106 us p50 and 1357 vs 190 us p99, and a
+# 64 MiB all-reduce 154 ms vs 35.5 ms (0.8 vs 3.3 GB/s). Those flags come from
+# 4x RTX PRO 6000 recipes and do not transfer to this dual-NUMA PCIe topology.
+# Let NCCL detect the topology itself.
+export SGLANG_DISABLE_CUSTOM_ALL_REDUCE=1  # it self-disables anyway above world_size 2
 
 COMMON=(
   --model-path "$MODEL"
