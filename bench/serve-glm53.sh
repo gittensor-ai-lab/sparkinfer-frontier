@@ -106,10 +106,14 @@ case "$MODE" in
                # sync and deadlocks inside CUDA-graph capture -- the server hangs
                # at 0% GPU rather than erroring. Eager decode is required until a
                # capturable kernel replaces it.
+               # The Triton MoE runner has no NVFP4 path at all -- only
+               # flashinfer_cutlass and flashinfer_trtllm implement W4A4, and
+               # trtllm targets sm100. Routing NVFP4 experts through triton
+               # collapses the hidden state and the logits go uniform.
                EXTRA=(--kv-cache-dtype fp8_e4m3
                       --dsa-prefill-backend flashinfer_sparse_mla
                       --dsa-decode-backend flashinfer_sparse_mla
-                      --moe-runner-backend triton
+                      --moe-runner-backend flashinfer_cutlass
                       --disable-cuda-graph) ;;
   tp8_tilelang)
                export SGLANG_ENABLE_JIT_DEEPGEMM=0

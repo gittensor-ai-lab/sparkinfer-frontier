@@ -65,13 +65,18 @@ def _gather_flat_latent(k_cache, indices):
     if latent == d_total or latent % _LATENT_BLOCK:
         return gathered.to(torch.bfloat16).reshape(*indices.shape, d_total)
 
-    # NOT VALIDATED: this path still emits garbage end to end. Both readings of the
-    # trailing scale rows were tried -- applied as an FP32 per-block multiplier, and
-    # ignored on the grounds that set_mla_kv_buffer_triton_fp8_quant stores a plain
-    # downcast -- and both produce the same broken output, so the defect is upstream
-    # of the dequant. Validate the gather against the writer on known tensors before
-    # trusting any of this.
-    out = gathered[:, :latent].to(torch.bfloat16)
+    # quantize_k_cache_separate stores tile/scale_inv with scale_inv =
+    # abs(tile).max()/448, so dequant multiplies the FP32 rows back in.
+    n_blocks = latent // _LATENT_BLOCK
+    vals = gathered[:, :latent].to(torch.float32).view(-1, n_blocks, _LATENT_BLOCK)
+    scales = (
+        gathered[:, latent:]
+        .contiguous()
+        .view(torch.uint8)
+        .view(torch.float32)[:, :n_blocks]
+        .view(-1, n_blocks, 1)
+    )
+    out = (vals * scales).view(-1, latent).to(torch.bfloat16)
     return out.reshape(*indices.shape, latent)
 
 
@@ -670,17 +675,22 @@ def flashinfer_sparse_mla_forward(
     # The compiled sm120 kernel is shaped for kv_lora_rank=512 with
     # qk_rope_head_dim=64; pure-NoPE models miss it on geometry, not on dispatch.
     if qk_rope_head_dim == 0:
-        topk_lengths = (indices >= 0).sum(dim=-1).to(torch.int32)
+        # topk_length is deliberately None: it masks every slot past position N,
+        # which is only equivalent to the -1 mask when the valid entries are packed
+        # at the front. The DSA page table is not packed here, so a length mask
+        # drops live entries and empties whole rows. indices < 0 alone is correct
+        # for both layouts.
         out, _ = _sm120_sparse_decode_fwd(
             q.unsqueeze(1),
             kv_cache,
             indices.unsqueeze(1),
-            topk_lengths,
+            None,
             None,
             kv_lora_rank,
             sm_scale,
         )
-        return out.squeeze(1)
+        out = out.squeeze(1)
+        return out
 
     result = trtllm_batch_decode_with_kv_cache_mla(
         query=q.unsqueeze(1),
