@@ -92,12 +92,25 @@ case "$MODE" in
   # SGLang ships a purpose-built sm120 sparse-MLA kernel (flash_mla_sm120.py) for
   # GLM DSA models with an FP8 KV cache. Both prefill and decode must use it --
   # the validator rejects any mix. This is the only DSA path with sm120 kernels.
+  # The FlashInfer default inside flash_mla_sm120 routes into TRTLLM-GEN MLA, which
+  # refuses GLM-5.3's qk_rope_head_dim=0 ("requires sparse_mla_top_k_lens"). The
+  # torch fallback in the same file is layout-independent after the gather, so with
+  # a flat-latent gather it serves GLM-5.3 -- unfused and slow, but correct first.
   tp8_sm120mla)
                export SGLANG_ENABLE_JIT_DEEPGEMM=0
+               # Leave SGLANG_SM120_FLASHMLA_BACKEND at flashinfer: with
+               # sparse_mla_top_k_lens supplied for NoPE, the real CUTLASS sm120
+               # kernel is usable, and the torch fallback is orders slower.
+               # The NoPE reference path does a boolean-mask assignment
+               # (gathered_kv[invalid_mask] = 0), which forces a device-to-host
+               # sync and deadlocks inside CUDA-graph capture -- the server hangs
+               # at 0% GPU rather than erroring. Eager decode is required until a
+               # capturable kernel replaces it.
                EXTRA=(--kv-cache-dtype fp8_e4m3
                       --dsa-prefill-backend flashinfer_sparse_mla
                       --dsa-decode-backend flashinfer_sparse_mla
-                      --moe-runner-backend triton) ;;
+                      --moe-runner-backend triton
+                      --disable-cuda-graph) ;;
   tp8_tilelang)
                export SGLANG_ENABLE_JIT_DEEPGEMM=0
                # bfloat16 must be explicit: `auto` resolves to fp8_e4m3 on Blackwell,

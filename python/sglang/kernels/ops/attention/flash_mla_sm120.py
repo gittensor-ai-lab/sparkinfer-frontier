@@ -28,11 +28,8 @@ _is_hip = is_hip()
 _GLM_DSA_MODEL_ARCHS = (
     "GlmMoeDsaForCausalLM",
     "GlmMoeDsaForCausalLMNextN",
-    # GLM-5.3-Flash runs the same DSA sparse-MLA attention; its support landed on a
-    # separate branch (PR #36507) that never extended this list, so sm120 rejected
-    # it even though the kernel path applies. Without these, GLM-5.3 on sm120 has
-    # no viable DSA backend at all: trtllm's TllmGenFmhaRunner is sm100-only and
-    # tilelang asks for 148 KB of dynamic shared memory against a 99 KB limit.
+    # GLM-5.3-Flash runs the same DSA sparse-MLA attention. On sm120 no other DSA
+    # backend applies: fa3/trtllm are sm100-only, tilelang needs 148 KB smem vs 99 KB.
     "Glm5NextForConditionalGeneration",
     "Glm5NextForConditionalGenerationNextN",
 )
@@ -53,6 +50,31 @@ _SCALE_STRIDE = _NUM_TILES + 1  # 8 (7 scales + 1 pad)
 _D = _NOPE_DIM + _ROPE_DIM  # 512
 
 
+_LATENT_BLOCK = 128  # DSATokenToKVPool.quant_block_size
+
+
+def _gather_flat_latent(k_cache, indices):
+    """Gather from DSATokenToKVPool's flat cache: (num_tokens, 1, D) fp8, no paging."""
+    d_total = k_cache.shape[-1]
+    flat = k_cache.reshape(-1, d_total)
+    gathered = flat[indices.clamp(min=0).reshape(-1)]  # (N, d_total)
+
+    # calculate_mla_kv_cache_dim packs a row as kv_lora_rank FP8 values, then
+    # kv_lora_rank//quant_block_size FP32 scales, then rope*2 bytes (0 when NoPE).
+    latent = (d_total * _LATENT_BLOCK) // (_LATENT_BLOCK + 4)
+    if latent == d_total or latent % _LATENT_BLOCK:
+        return gathered.to(torch.bfloat16).reshape(*indices.shape, d_total)
+
+    # NOT VALIDATED: this path still emits garbage end to end. Both readings of the
+    # trailing scale rows were tried -- applied as an FP32 per-block multiplier, and
+    # ignored on the grounds that set_mla_kv_buffer_triton_fp8_quant stores a plain
+    # downcast -- and both produce the same broken output, so the defect is upstream
+    # of the dequant. Validate the gather against the writer on known tensors before
+    # trusting any of this.
+    out = gathered[:, :latent].to(torch.bfloat16)
+    return out.reshape(*indices.shape, latent)
+
+
 def _gather_and_dequant(k_cache, indices, page_size):
     """Gather KV entries from the paged buffer using correct page-internal addressing.
 
@@ -65,6 +87,12 @@ def _gather_and_dequant(k_cache, indices, page_size):
     Returns:
         kv: (..., _D) bfloat16, dequantized KV vectors
     """
+    # DSv4 hands back a 4D paged buffer (num_pages, page_size, 1, bytes_per_token)
+    # whose bytes need unpacking. A 3D buffer is an unpacked latent cache
+    # (num_tokens, 1, D) -- GLM-5.3's shape -- and gathers directly.
+    if k_cache.dim() == 3:
+        return _gather_flat_latent(k_cache, indices)
+
     idx_shape = indices.shape
     flat_idx = indices.reshape(-1)  # (N,)
     N = flat_idx.shape[0]
@@ -154,7 +182,13 @@ def _sm120_sparse_decode_fwd(
     extra_topk_length=None,
 ):
     B, s_q, H_q, D_qk = q.shape
-    num_pages, page_size, H_k, bpt = k_cache.shape
+    if k_cache.dim() == 4:
+        num_pages, page_size, H_k, bpt = k_cache.shape
+    else:
+        # Flat latent cache (num_tokens, H_k, D) -- GLM-5.3's DSATokenToKVPool
+        # shape. page_size only feeds the paged gather, which this layout skips.
+        num_pages, H_k, bpt = k_cache.shape
+        page_size = 1
     topk = indices.shape[-1]
 
     invalid_mask = indices < 0
@@ -183,7 +217,9 @@ def _sm120_sparse_decode_fwd(
         gathered_kv = torch.cat([gathered_kv, extra_kv], dim=2)
         invalid_mask = torch.cat([invalid_mask, extra_invalid], dim=2)
 
-    gathered_kv[invalid_mask] = 0.0
+    # masked_fill, not gathered_kv[mask] = 0: boolean-index assignment syncs to
+    # host to size the write, which deadlocks the TP collectives.
+    gathered_kv = gathered_kv.masked_fill(invalid_mask.unsqueeze(-1), 0.0)
 
     q_f = q.float()
     kv_f = gathered_kv.float()
@@ -204,10 +240,10 @@ def _sm120_sparse_decode_fwd(
         lse_for_out = lse.clone()
 
     lonely = lse == float("-inf")
-    lse_for_out[lonely] = float("inf")
+    lse_for_out = lse_for_out.masked_fill(lonely, float("inf"))
     weights = torch.exp(scores - lse_for_out.unsqueeze(-1))
     out = torch.einsum("bsht,bstv->bshv", weights, kv_f[..., :head_dim_v])
-    out[lonely.unsqueeze(-1).expand_as(out)] = 0.0
+    out = out.masked_fill(lonely.unsqueeze(-1), 0.0)
 
     return out.to(torch.bfloat16), lse.permute(0, 2, 1)
 
@@ -630,6 +666,22 @@ def flashinfer_sparse_mla_forward(
     from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
     topk = indices.shape[1]
+
+    # The compiled sm120 kernel is shaped for kv_lora_rank=512 with
+    # qk_rope_head_dim=64; pure-NoPE models miss it on geometry, not on dispatch.
+    if qk_rope_head_dim == 0:
+        topk_lengths = (indices >= 0).sum(dim=-1).to(torch.int32)
+        out, _ = _sm120_sparse_decode_fwd(
+            q.unsqueeze(1),
+            kv_cache,
+            indices.unsqueeze(1),
+            topk_lengths,
+            None,
+            kv_lora_rank,
+            sm_scale,
+        )
+        return out.squeeze(1)
+
     result = trtllm_batch_decode_with_kv_cache_mla(
         query=q.unsqueeze(1),
         kv_cache=kv_cache.view(torch.uint8)
