@@ -918,7 +918,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ):
                 n = forward_batch.out_cache_loc.shape[0]
                 self.cuda_graph_swa_out_cache_loc[n:].zero_()
-                if in_capture and self.kv_index_translator.is_translating:
+                if in_capture:
+                    # Zeros route the capture forward's KV writes to slot 0, the
+                    # reserved sink, rather than to a live page; replay-prep
+                    # refills below. True for any pool, so the phase alone
+                    # decides.
                     self.cuda_graph_swa_out_cache_loc[:n].zero_()
                 else:
                     self.cuda_graph_swa_out_cache_loc[:n].copy_(

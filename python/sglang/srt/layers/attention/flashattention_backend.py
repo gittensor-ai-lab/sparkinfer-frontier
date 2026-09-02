@@ -2780,9 +2780,12 @@ class FlashAttentionBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             n = out_cache_loc.shape[0]
             self.cuda_graph_swa_out_cache_loc[n:].zero_()
-            if in_capture and self.kv_index_translator.is_translating:
+            if in_capture:
                 # A capture batch never went through `init_new`, so there is no
-                # rebound write loc; zeros are the page-0 sink.
+                # rebound write loc, and the capture forward does write KV:
+                # zeros route it to slot 0, the reserved sink, rather than to a
+                # live page. Replay-prep refills below, so the phase alone
+                # decides and the pool does not enter into it.
                 self.cuda_graph_swa_out_cache_loc[:n].zero_()
             else:
                 self.cuda_graph_swa_out_cache_loc[:n].copy_(
