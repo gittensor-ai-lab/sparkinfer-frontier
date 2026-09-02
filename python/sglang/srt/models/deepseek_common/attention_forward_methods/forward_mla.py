@@ -85,6 +85,9 @@ class MlaBmmFusionPlan:
     attn_output_buf: torch.Tensor
 
 
+_ABSORB_TRACE = 2
+
+
 def _select_local_dcp_heads_for_autotune(
     attn_output: torch.Tensor, num_local_heads: int
 ) -> torch.Tensor:
@@ -683,6 +686,20 @@ class DeepseekMLAForwardMixin:
         fusion_plan: Optional[MlaBmmFusionPlan] = None,
         gate: Optional[torch.Tensor] = None,
     ):
+        global _ABSORB_TRACE
+        if _ABSORB_TRACE > 0:
+            _ABSORB_TRACE -= 1
+            import logging as _lg
+            def _st(name, t):
+                if t is None or not hasattr(t, "numel") or t.numel() == 0:
+                    return f"{name}=empty"
+                f = t.float()
+                return f"{name}[nan={int(f.isnan().sum())} absmax={float(f.abs().max()):.3f}]"
+            _lg.getLogger(__name__).warning(
+                "[absorb-in] %s %s %s %s %s",
+                _st("q_pe", q_pe), _st("k_pe", k_pe), _st("q_nope_out", q_nope_out),
+                _st("k_nope", k_nope), _st("topk_idx", topk_indices),
+            )
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:

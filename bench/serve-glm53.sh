@@ -113,7 +113,7 @@ case "$MODE" in
                EXTRA=(--kv-cache-dtype fp8_e4m3
                       --dsa-prefill-backend flashinfer_sparse_mla
                       --dsa-decode-backend flashinfer_sparse_mla
-                      --moe-runner-backend flashinfer_cutlass
+                      --moe-runner-backend marlin
                       --disable-cuda-graph) ;;
   tp8_tilelang)
                export SGLANG_ENABLE_JIT_DEEPGEMM=0
