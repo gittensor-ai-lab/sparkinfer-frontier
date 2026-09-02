@@ -2720,13 +2720,6 @@ class FlashAttentionBackend(AttentionBackend):
         the rows instead of a translated build plus a verbatim copy of it.
         """
         translated = self.kv_index_translator.reads_are_translated
-        if translated:
-            self.kv_index_translator.fill_read_table(
-                out=metadata.page_table,
-                sliding_window_out=metadata.swa_page_table,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-            )
         normal_decode_set_metadata(
             metadata.cache_seqlens_int32,
             metadata.cu_seqlens_k,
@@ -2741,6 +2734,18 @@ class FlashAttentionBackend(AttentionBackend):
             self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
             skip_page_table=translated,
         )
+        if translated:
+            # `cache_seqlens_int32` is what the attention kernel bounds its
+            # page-table reads by, and the fused call above just wrote it. Fill
+            # exactly that many pages: a draft decode reads `seq_len_delta`
+            # further than `seq_lens` goes, and those columns have to be
+            # translated too.
+            self.kv_index_translator.fill_read_table(
+                out=metadata.page_table,
+                sliding_window_out=metadata.swa_page_table,
+                req_pool_indices=req_pool_indices,
+                seq_lens=metadata.cache_seqlens_int32,
+            )
 
     def _apply_cuda_graph_metadata(
         self,

@@ -342,9 +342,14 @@ class KVIndexTranslator:
         `sliding_window_out` fills the swa twin in the same pass, for a hybrid
         model whose kernels take two block tables.
         """
-        assert (
-            self.is_translating
-        ), "KVIndexTranslator.fill_read_table on a pool that needs no translation"
+        # `reads_are_translated`, not `is_translating`: under DCP the builder
+        # returns the passthrough view and writes nothing, so `is_translating`
+        # would let a caller keep a stale table and never hear about it.
+        assert self.reads_are_translated, (
+            "KVIndexTranslator.fill_read_table cannot fill a page table when "
+            "reads stay virtual (a non-unified pool, or DCP, where the caller "
+            "must select this rank's share itself)"
+        )
         assert sliding_window_out is None or self._swa_v2p_table is not None, (
             "KVIndexTranslator.fill_read_table: asked for a sliding-window "
             "table on a pool with no swa sub-pool"
