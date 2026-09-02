@@ -28,6 +28,13 @@ _is_hip = is_hip()
 _GLM_DSA_MODEL_ARCHS = (
     "GlmMoeDsaForCausalLM",
     "GlmMoeDsaForCausalLMNextN",
+    # GLM-5.3-Flash runs the same DSA sparse-MLA attention; its support landed on a
+    # separate branch (PR #36507) that never extended this list, so sm120 rejected
+    # it even though the kernel path applies. Without these, GLM-5.3 on sm120 has
+    # no viable DSA backend at all: trtllm's TllmGenFmhaRunner is sm100-only and
+    # tilelang asks for 148 KB of dynamic shared memory against a 99 KB limit.
+    "Glm5NextForConditionalGeneration",
+    "Glm5NextForConditionalGenerationNextN",
 )
 
 # Page layout constants for DSv4-Flash (MODEL1):

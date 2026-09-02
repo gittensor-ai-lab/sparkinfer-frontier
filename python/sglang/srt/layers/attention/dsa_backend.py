@@ -846,7 +846,14 @@ class DeepseekSparseAttnBackend(
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
-            or dsa_impl in ("fa3", "tilelang", "trtllm")
+            # flashinfer_sparse_mla is the only DSA backend with sm120 kernels, and
+            # its Triton decode takes topk from indices.shape[-1], masks negative
+            # entries, and honours a per-row topk_length -- appended tail tokens are
+            # just more (already masked) entries, so it needs no fixed-width
+            # assumption. Without this, GLM-5.3 (index_kpool=4) has no sm120 path at
+            # all: fa3/trtllm are sm100-only and tilelang wants 148 KB of shared
+            # memory against this card's 99 KB.
+            or dsa_impl in ("fa3", "tilelang", "trtllm", "flashinfer_sparse_mla")
         ):
             return
         raise NotImplementedError(
@@ -866,6 +873,11 @@ class DeepseekSparseAttnBackend(
             or dsa_impl != "flashmla_sparse"
         ):
             return dsa_impl
+        # sm120 is >= 10 but is NOT datacenter Blackwell: trtllm's TllmGenFmhaRunner
+        # is sm100-only, so rerouting there strands consumer Blackwell with no
+        # working backend. Send it to the sm120 sparse-MLA kernel instead.
+        if self.device_sm_major == 12:
+            return "flashinfer_sparse_mla"
         if self.device_sm_major >= 10:
             return "trtllm"
         if self.device_sm_major == 9:
