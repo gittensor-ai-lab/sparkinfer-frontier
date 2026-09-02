@@ -87,6 +87,7 @@ from sglang.srt.models.deepseek_common.utils import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Glm5NextMLP
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE as Glm5NextMoE
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.models.glm_ocr import (
     GlmOcrRMSNorm,
     GlmOcrVisionBlock,
@@ -1078,6 +1079,33 @@ class Glm5NextModel(nn.Module):
 
 
 class Glm5NextForConditionalGeneration(nn.Module):
+    # The checkpoint nests the text tower under `model.language_model.*` while the
+    # decoder is built flat as `model.*` (load_weights strips the segment below).
+    # Quantization configs carry module names too -- a compressed-tensors `ignore`
+    # list naming `model.language_model.<...>.self_attn.qkv_proj` matches nothing
+    # once the module is `model.<...>.self_attn.qkv_proj`, so an unquantized
+    # attention layer is neither ignored nor matched to a config group and
+    # find_matched_target raises. Declaring the mapper here lets
+    # apply_weight_name_mapper rewrite those lists the same way.
+    # `forget_gate.` is a second such artifact, and only in the metadata: no tensor
+    # name contains it (the KDA projections ship flat as `self_attn.f_a_proj.weight`),
+    # yet the ignore list records `self_attn.forget_gate.f_a_proj` while listing the
+    # sibling `g_a_proj` flat. Drop the segment so both spellings resolve.
+    # Both rewrites are needed, and they must go in different buckets:
+    # WeightsMapper._map_name applies at most ONE orig_to_new_substr rule (it breaks
+    # after the first match), so two substr entries would silently drop the shorter
+    # one. The prefix and substr loops run independently, hence prefix + substr here.
+    # The vision tower is built at top level as `visual.*` (not `model.visual.*`) and
+    # fuses q/k/v into `attn.qkv_proj`, where the checkpoint records `attn.qkv`.
+    # Multiple prefix rules are fine -- a name matches at most one of them.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.language_model.": "model.",
+            "model.visual.": "visual.",
+        },
+        orig_to_new_substr={"forget_gate.": ""},
+        orig_to_new_suffix={".attn.qkv": ".attn.qkv_proj"},
+    )
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
         "fused_qkvbfg_a_proj": [
