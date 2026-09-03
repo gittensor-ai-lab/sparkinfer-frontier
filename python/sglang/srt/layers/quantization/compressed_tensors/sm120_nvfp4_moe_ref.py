@@ -6,9 +6,10 @@ the ModelOpt NVFP4 weight layout, so handing it a compressed-tensors checkpoint
 returns NaN rather than an error. Measured on 8x RTX 5090: expert weights load
 correctly and the MoE input is clean, yet the layer output is entirely NaN.
 
-This dequantises to bfloat16 and runs a plain grouped GEMM instead. It is a
-correctness path, not a fast one -- it materialises one expert's weights at a
-time and loops over the experts a batch touches.
+Each expert's GEMMs go through nvfp4_gemm, a Triton kernel that unpacks the
+e2m1 nibbles and applies the per-group scale inside the matmul, so weights are
+never materialised in bfloat16. The loop over the experts a batch touches
+remains: that is the next thing to fuse.
 """
 
 from __future__ import annotations
@@ -16,7 +17,9 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers.quantization.dequantization import dequantize_nvfp4
+from sglang.srt.layers.quantization.compressed_tensors.sm120_nvfp4_moe_triton import (
+    nvfp4_gemm,
+)
 
 
 def sm120_nvfp4_moe_forward(
@@ -65,21 +68,22 @@ def sm120_nvfp4_moe_forward(
         if tokens.numel() == 0:
             continue
 
-        w13 = dequantize_nvfp4(
-            w13_weight[expert], w13_weight_scale[expert], w13_weight_scale_2[expert]
-        )
-        w2 = dequantize_nvfp4(
-            w2_weight[expert], w2_weight_scale[expert], w2_weight_scale_2[expert]
-        )
-
+        # nvfp4_gemm unpacks and scales inside the GEMM, so the expert's weights
+        # are read once at 4 bits instead of being materialised in bfloat16.
         rows = x[tokens].to(torch.bfloat16)
-        gate, up = (rows @ w13.transpose(0, 1)).chunk(2, dim=-1)
+        gate, up = nvfp4_gemm(
+            rows, w13_weight[expert], w13_weight_scale[expert],
+            w13_weight_scale_2[expert],
+        ).chunk(2, dim=-1)
         if swiglu_limit is not None:
             # GLM-5.3 clamps both halves before the product (swiglu_limit=10.0);
             # leaving SwiGLU unbounded degrades long generations into repetition.
             gate = gate.clamp(max=swiglu_limit)
             up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-        y = (F.silu(gate) * up) @ w2.transpose(0, 1)
+        y = nvfp4_gemm(
+            (F.silu(gate) * up).to(torch.bfloat16), w2_weight[expert],
+            w2_weight_scale[expert], w2_weight_scale_2[expert],
+        )
 
         if not apply_router_weight_on_input:
             weight = (topk_weights * selected).sum(dim=-1)[tokens]

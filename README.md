@@ -61,16 +61,42 @@ desynchronises ranks and hangs NCCL at 0% GPU with no error. `masked_fill` is
 the sync-free form. The same sync deadlocks CUDA-graph capture, so this path
 runs eager.
 
+## Kernels
+
+`sm120_nvfp4_moe_triton.py` is a fused NVFP4 GEMM: it unpacks the e2m1 nibbles
+and applies the per-group FP8 scale inside the matmul, so expert weights are read
+once at 4 bits and never materialised in bfloat16. Tiles are 64x64x64, sized for
+sm120's 99 KB of shared memory rather than sm100's 228 KB.
+
+Against `dequantize_nvfp4` + `torch.matmul` on identical packed weights
+(`bench/test_nvfp4_gemm.py`):
+
+| M | N | K | rel err | dequant+matmul | fused | |
+|---|---|---|---|---|---|---|
+| 64 | 512 | 4096 | 0.0024 | 0.298 ms | 0.087 ms | **3.42x** |
+| 256 | 512 | 4096 | 0.0043 | 0.297 ms | 0.087 ms | **3.41x** |
+| 1024 | 4096 | 2048 | 0.0030 | 0.382 ms | 0.303 ms | 1.26x |
+
+Small M is the case that matters: each expert only sees the tokens routed to it.
+The global scale is read from a device pointer inside the kernel -- passing it as
+a Python float syncs once per expert, roughly 90 times per layer.
+
 ## Known limitations
 
-- The MoE reference materialises one expert at a time in a Python loop, and CUDA
-  graphs are off. **A fused sm120 NVFP4 MoE kernel is the open performance work**;
-  the reference exists to validate it against.
+- End to end is **2.5 tok/s** (16 tokens in 6.4 s). The fused GEMM is in, but the
+  MoE still loops over experts in Python, one kernel launch each, with CUDA
+  graphs off. **Batching the routed experts into a single grouped GEMM is the
+  next win**, worth far more than the GEMM itself.
 - Long greedy decodes still show phrase-level repetition. Short answers, facts,
   arithmetic and chain-of-thought are correct.
-- Communication is the ceiling on this box: a 8 KiB all-reduce costs ~106 us and
-  64 MiB reaches 3.3 GB/s against PCIe Gen4's ~25 GB/s, capping decode near
-  105 tok/s before any compute. See `bench/bench_allreduce.py`.
+- Communication costs ~106 us for an 8 KiB all-reduce and 3.3 GB/s at 64 MiB,
+  which bounds decode near 105 tok/s before any compute. NCCL is used as-is:
+  `bench/pcie_allreduce.py` measures a NUMA-hierarchical variant (1.5-3x
+  **slower** -- NCCL already reduces topology-aware) and reduce_scatter + FP8
+  all_gather (1.07x faster, 4.5e-2 relative error, a poor trade). The 3.3 GB/s
+  figure is much closer to the practical ceiling than PCIe's 25 GB/s per-GPU
+  number suggests, since an 8-way all-reduce moves 2(N-1)/N of the data through
+  shared host memory.
 
 ## Upstream bugs found
 
