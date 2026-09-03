@@ -1,67 +1,61 @@
-# KDA prefix-cache corruption: root-cause diagnosis
+# KDA prefix-cache corruption: what is established
 
 ## Symptom
 A radix prefix hit on `glm5_next` returns a wrong-but-fluent answer. Cold cache
-recalls the needle (`4817-QUARTZ-9930`); a hit returns a near-miss (`4830`,
-`6888`, `48`). KV is exact; the KDA recurrent state restored at the match point
-is not. Reproducer: `bench/test_prefix_cache.py`.
+recalls the needle (`4817-QUARTZ-9930`); a hit returns a near-miss (`4862`,
+`4830`, `6888`). KV is exact; the KDA recurrent state is not.
 
-## Root cause (localized, measured)
-A KDA checkpoint donated by an **in-flight (unfinished / chunked-prefill)**
-request misresumes on a later partial-prefix hit. A checkpoint donated when a
-request **finishes** is exact.
+## Read this first: an earlier round of results was invalid
+`/flush_cache` refuses while any request is running or queued and still answers
+200, with a refusal string in the body. The test called it fire-and-forget, so
+flushes silently did nothing and "cold" runs were served warm. Every conclusion
+drawn before `flush()` verified its result is untrustworthy -- in particular the
+claim that the fault was **in-flight vs finished donors**, which does not
+survive re-testing. `flush()` now retries until the body says flushed and raises
+if it cannot.
 
-Measured on the running server, radix cache on:
+## Established with verified flushes
 
-| donor | reuse | result |
-|---|---|---|
-| finished request, new request extends it (multi-turn) | `cached_tokens=2624`, needle recalled | **correct** |
-| finished short donor, needle recomputed past it (`--prime-tokens 4096`, needle at ~6.3K) | needle recomputed | **correct** |
-| long in-flight donor, shared prefix ends at an interior checkpoint (`--prime shifted`) | interior checkpoint reused | **wrong** |
+| scenario | result |
+|---|---|
+| identical prompt sent twice, cache warm between (`test_cache_repeat.py`) | **pass**, byte-identical |
+| identical prompt twice, flushed between (control) | **pass** |
+| prime with a prompt that shares a prefix then diverges, then the real prompt (`test_prefix_cache.py --prime shifted`) | **fail**, both depths |
 
-So the fault is specific to reusing a checkpoint that a **chunked, not-yet-finished**
-prefill donated at an interior grid boundary. `test_prefix_cache.py --prime same`
-(warm resumes from a checkpoint that encodes exactly the warm prompt) passes,
-which rules out the donate/restore copy itself (`MambaPool.copy_from` copies both
-conv and temporal correctly).
+So reusing your own identical entry is fine. The corruption needs a **branching**
+prefix: another request that shares a prefix and then diverges.
 
-## Where it is
-`cache_unfinished_req` donates the request's current KDA state as a reusable
-checkpoint at the last grid boundary of each chunk. During chunked prefill the
-donated state does not correspond to the depth it is filed under, so a second
-request that matches that depth and recomputes the tail resumes from the wrong
-state. The write path is
-`hybrid_linear_attn_backend.py::_track_mamba_state_extend` (aligned path copies
-the live chunk-end `ssm_states`; `_init_track_ssm_indices` keys aligned/unaligned
-on `state_chunk_size`, not on the chunk's actual end) feeding
-`mamba_component.py::prepare_for_caching_req` (unfinished branch).
+## The branching request's match
 
-## Why the obvious fix does not land here
-"Donate a reusable checkpoint only when the request finishes" is directionally
-correct and makes `test_prefix_cache.py` pass. But suppressing the unfinished
-donation breaks a tighter invariant: `cache_unfinished_req` re-matches the
-request's **own** just-inserted prefix to continue its next chunk, and that
-re-match is gated on a mamba checkpoint existing on the node
-(`create_match_validator` requires `component_data[MAMBA].value`). Remove the
-checkpoint and the re-match returns zero indices:
+Instrumenting `finalize_match_result_in_tree_core` and logging only matches that
+branch or leave KV ahead of the recurrent state (a request's own chunked
+continuation shows neither and floods the log otherwise):
 
 ```
-AssertionError: new_prefix_len=2048, len(new_indices)=0   (unified_radix_cache.py)
+full_kv_hit=6336  mamba_boundary=0  dev_idx=0  branch=6336
 ```
 
-A request's own chunked continuation and cross-request reuse share the same
-checkpoint. A correct fix has to separate them -- e.g. mark an interior
-checkpoint "usable by this request's continuation only, not a cross-request
-reuse boundary," or fix the interior state capture so the donated state matches
-its filed depth. Both are upstream protocol changes, out of scope for a runtime
-workaround.
+KV matched 6336 tokens, no mamba checkpoint was usable (`mamba_boundary=0`, so
+`dev_idx=0` -- nothing reused), and the request is nonetheless assigned
+`mamba_branching_seqlen=6336`. The needle sits at ~6.3K, right at that branch.
+
+## Ruled out
+- **A KV / recurrent-state depth gap on the reused path.** Every non-branching
+  match measured has `full_kv_hit == mamba_boundary == dev_idx`.
+- **Interior vs finished donor.** Suppressing mid-prefill donations does make
+  the test pass, but only because it also disables KV reuse
+  (`cached_tokens` 2624 -> 0); it is no better than turning the cache off. The
+  distinction itself rests on pre-flush-fix data.
+- **Tagging checkpoints with an owning request.** Radix nodes are shared by key,
+  not owned by a request, so this makes insert and match disagree and trips
+  `new_prefix_len=2048, len(new_indices)=0`.
+- **The branching-point checkpoint.** Forcing `mamba_branching_seqlen = None`
+  does not fix it (re-tested after the flush fix).
 
 ## Shipped
-`--disable-radix-cache`. Correct, at the cost of prefix reuse. This is upstream
-bug #6 in the README.
+`--disable-radix-cache`. Correct, at the cost of prefix reuse. Upstream bug #6.
 
-## Reproducer knobs (`bench/test_prefix_cache.py`)
-- `--prime same` -- prime with the identical prompt; isolates the handoff.
-- `--prime shifted` -- prime with the needle moved deeper; the failing case.
-- `--prime-tokens K` -- prime with the first K tokens (finished donor at K).
-- `--needle-at N` -- place the needle near token N (straddle a chunk boundary).
+## Tools
+- `bench/test_cache_repeat.py` -- one prompt twice, nothing else moving.
+- `bench/test_prefix_cache.py` -- `--prime same|shifted`, `--prime-tokens K`,
+  `--needle-at N`. Both now guard `main()` so importing one does not run it.

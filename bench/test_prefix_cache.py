@@ -76,14 +76,25 @@ def generate_ids(url, ids, max_new_tokens=24):
     return (out["text"] if isinstance(out, dict) else out[0]["text"]).strip()
 
 
-def flush(url):
-    try:
-        urllib.request.urlopen(
-            urllib.request.Request(url + "/flush_cache", data=b""), timeout=60
-        ).read()
-    except Exception:
-        pass
-    time.sleep(2)
+def flush(url, attempts=20):
+    """Flush and confirm it happened.
+
+    /flush_cache refuses while any request is running or queued and answers 200
+    with a refusal string, so a fire-and-forget call silently leaves the cache
+    populated -- which quietly turns a cold run into a warm one.
+    """
+    for _ in range(attempts):
+        try:
+            body = urllib.request.urlopen(
+                urllib.request.Request(url + "/flush_cache", data=b""), timeout=60
+            ).read().decode()
+        except Exception:
+            body = ""
+        if "flushed" in body.lower():
+            time.sleep(1)
+            return
+        time.sleep(2)
+    raise RuntimeError("could not flush the radix cache; results would be confounded")
 
 
 def main() -> None:
@@ -157,4 +168,5 @@ def main() -> None:
     sys.exit(1 if failures else 0)
 
 
-main()
+if __name__ == "__main__":
+    main()
