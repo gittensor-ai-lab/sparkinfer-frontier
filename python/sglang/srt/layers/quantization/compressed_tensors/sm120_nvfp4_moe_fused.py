@@ -19,7 +19,20 @@ from sglang.srt.layers.quantization.compressed_tensors.sm120_nvfp4_moe_triton im
     nvfp4_grouped_gemm,
 )
 
-_BLOCK_M = 64
+def _block_m(num_tokens: int, top_k: int) -> int:
+    """Pick the row tile so decode does not pad 8 real rows out to 512.
+
+    moe_align_block_size rounds every expert up to a whole block, so at batch 1
+    each of the top_k experts owns one row and a 64-row tile wastes 63/64 of the
+    work. 16 is the floor where tl.dot still uses tensor cores.
+    """
+    routed = num_tokens * top_k
+    if routed <= 64:
+        return 16
+    if routed <= 512:
+        return 32
+    return 64
+
 
 
 def sm120_nvfp4_moe_fused(
@@ -51,14 +64,15 @@ def sm120_nvfp4_moe_fused(
     if apply_router_weight_on_input:
         x = x * topk_weights.sum(dim=-1, keepdim=True).to(x.dtype)
 
+    block_m = _block_m(num_tokens, top_k)
     sorted_ids, expert_ids, num_valid = moe_align_block_size(
-        topk_ids, _BLOCK_M, num_experts
+        topk_ids, block_m, num_experts
     )
 
     # gate+up for every routed pair in one launch, then the same for down.
     h = nvfp4_grouped_gemm(
         x, w13_weight, w13_weight_scale, w13_weight_scale_2,
-        sorted_ids, expert_ids, num_valid, top_k, _BLOCK_M,
+        sorted_ids, expert_ids, num_valid, top_k, block_m,
     )
     gate, up = h.chunk(2, dim=-1)
     if swiglu_limit is not None:
@@ -73,7 +87,7 @@ def sm120_nvfp4_moe_fused(
     ) * top_k
     y = nvfp4_grouped_gemm(
         act, w2_weight, w2_weight_scale, w2_weight_scale_2,
-        identity, expert_ids, num_valid, top_k, _BLOCK_M,
+        identity, expert_ids, num_valid, top_k, block_m,
     )
 
     # Scatter the sorted rows back onto their tokens, weighted by the router.

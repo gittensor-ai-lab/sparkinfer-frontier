@@ -18,10 +18,18 @@ No datacenter GPU, no NVLink, no P2P.
 |---|---:|---|
 | per-expert reference | 2.5 | one kernel launch per expert, ~90 per layer |
 | grouped MoE | 6.0 | two grouped GEMMs per layer, however many experts fire |
-| **+ CUDA graphs** | **34.1** | capture across 45 layers x 8 ranks |
+| + CUDA graphs | 34.1 | capture across 45 layers x 8 ranks |
+| **+ adaptive block size** | **36.8** | stop padding 8 routed rows out to 512 |
 
-16 tokens in 469 ms warm. Communication bounds this box near 105 tok/s, so about
-3x of headroom remains and attention is what is consuming it.
+16 tokens in 435 ms warm, a 14.7x gain. Communication bounds this box near
+105 tok/s.
+
+Decode at batch 1 is launch-bound, not compute-bound: the adaptive block size cut
+the MoE's padded work 4x but moved end to end only 8%, and a hand-written fused
+attention kernel came out *slower* than the reference it replaced (cuBLAS einsum
+is hard to beat with a manual reduction). Per-token cost divides roughly as MoE
+23 ms, MLA attention 8 ms, all-reduce 9.5 ms measured eagerly -- graphs overlap
+much of that.
 
 ## The node
 
@@ -118,8 +126,10 @@ since an 8-way all-reduce moves `2(N-1)/N` of the data through shared host memor
 
 ## Known limitations
 
-- Attention is still the unfused NoPE reference, materialising
-  `[tokens, heads, 2051, 512]` in fp32 per layer. **Fusing it is the next win.**
+- Attention is still the unfused NoPE reference. A fused Triton replacement was
+  tried and abandoned: 2.3x slower, because `tl.sum` over an outer product gives
+  up the tensor cores that cuBLAS uses. A `tl.dot`-based flash-decode is the
+  version worth writing.
 - Long greedy decodes show phrase-level repetition. Short answers, facts,
   arithmetic and chain-of-thought are correct.
 - Communication caps this box near 105 tok/s regardless of kernel work.
