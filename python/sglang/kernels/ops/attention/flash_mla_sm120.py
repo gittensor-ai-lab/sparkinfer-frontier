@@ -675,16 +675,17 @@ def flashinfer_sparse_mla_forward(
     # The compiled sm120 kernel is shaped for kv_lora_rank=512 with
     # qk_rope_head_dim=64; pure-NoPE models miss it on geometry, not on dispatch.
     if qk_rope_head_dim == 0:
-        # topk_length is deliberately None: it masks every slot past position N,
-        # which is only equivalent to the -1 mask when the valid entries are packed
-        # at the front. The DSA page table is not packed here, so a length mask
-        # drops live entries and empties whole rows. indices < 0 alone is correct
-        # for both layouts.
+        # The page table is a reused fixed-width buffer, so entries past the
+        # current row length can hold stale non-negative indices from an earlier,
+        # longer sequence. indices < 0 alone would attend to those; the row length
+        # bounds it. (Measured: 190 valid entries for a 19-token prefill, exactly
+        # the causal count, so valid entries are packed at the front.)
+        topk_lengths = (indices >= 0).sum(dim=-1).to(torch.int32)
         out, _ = _sm120_sparse_decode_fwd(
             q.unsqueeze(1),
             kv_cache,
             indices.unsqueeze(1),
-            None,
+            topk_lengths,
             None,
             kv_lora_rank,
             sm_scale,

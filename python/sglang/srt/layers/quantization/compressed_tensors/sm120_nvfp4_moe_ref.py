@@ -31,6 +31,8 @@ def sm120_nvfp4_moe_forward(
     w2_weight_scale: torch.Tensor,
     w2_weight_scale_2: torch.Tensor,
     activation: str = "silu",
+    swiglu_limit: float | None = None,
+    routed_scaling_factor: float | None = None,
     apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
     """Run the routed experts for ``x`` and return the combined output.
@@ -72,11 +74,21 @@ def sm120_nvfp4_moe_forward(
 
         rows = x[tokens].to(torch.bfloat16)
         gate, up = (rows @ w13.transpose(0, 1)).chunk(2, dim=-1)
+        if swiglu_limit is not None:
+            # GLM-5.3 clamps both halves before the product (swiglu_limit=10.0);
+            # leaving SwiGLU unbounded degrades long generations into repetition.
+            gate = gate.clamp(max=swiglu_limit)
+            up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
         y = (F.silu(gate) * up) @ w2.transpose(0, 1)
 
         if not apply_router_weight_on_input:
             weight = (topk_weights * selected).sum(dim=-1)[tokens]
             y = y * weight.unsqueeze(-1).to(y.dtype)
         out.index_add_(0, tokens, y.to(out.dtype))
+
+    # The MoE runners scale the combined routed output (GLM-5.3: 2.5); bypassing
+    # them means applying it here or the experts land 2.5x under the residual.
+    if routed_scaling_factor is not None:
+        out = out * routed_scaling_factor
 
     return out

@@ -327,6 +327,8 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                     w2_weight_scale=layer.w2_weight_scale,
                     w2_weight_scale_2=layer.w2_weight_scale_2,
                     activation=self.moe_runner_config.activation,
+                    swiglu_limit=self.moe_runner_config.swiglu_limit,
+                    routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
                     apply_router_weight_on_input=(
                         self.moe_runner_config.apply_router_weight_on_input
                     ),

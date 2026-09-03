@@ -120,6 +120,10 @@ case "$MODE" in
                       # weight_packed/weight_scale/weight_global_scale. The zero
                       # global scale then becomes inf via 1/x and NaNs the layer.
                       --disable-shared-experts-fusion
+                      # Without these the chat template's raw </think> and tool
+                      # syntax leak into message.content.
+                      --reasoning-parser glm45
+                      --tool-call-parser glm47
                       --disable-cuda-graph) ;;
   tp8_tilelang)
                export SGLANG_ENABLE_JIT_DEEPGEMM=0
