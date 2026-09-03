@@ -179,7 +179,30 @@ def _gather_and_dequant(k_cache, indices, page_size):
 # topk entries per row and upcasts them to fp32, so a full 2048-row prefill
 # chunk at index_topk=2048 asks for ~17 GB and OOMs a 32 GB card. Rows are
 # independent given their own indices, so the forward runs in slices.
-_ROW_CHUNK_BYTES = 512 << 20
+#
+# A fixed budget cannot serve both ends: a 128K-context config leaves GBs free,
+# while a 860K one leaves ~0.6 GB, where a 512 MB slice is itself the OOM. So
+# take a share of what is actually free, once, and cache it -- free memory is
+# stable after the pools are carved, and re-reading it per call would put a
+# cudaMemGetInfo in the decode path.
+_ROW_CHUNK_MIN = 64 << 20
+_ROW_CHUNK_MAX = 512 << 20
+_ROW_CHUNK_SHARE = 0.35
+_row_chunk_bytes = None
+
+
+def _row_chunk_budget():
+    global _row_chunk_bytes
+    if _row_chunk_bytes is None:
+        # Capture records a fixed graph, so querying the driver here would both
+        # bake in one reading and risk a sync. Decode captures few rows anyway.
+        if torch.cuda.is_current_stream_capturing():
+            return _ROW_CHUNK_MIN
+        free, _ = torch.cuda.mem_get_info()
+        _row_chunk_bytes = int(
+            max(_ROW_CHUNK_MIN, min(_ROW_CHUNK_MAX, free * _ROW_CHUNK_SHARE))
+        )
+    return _row_chunk_bytes
 
 
 def _row_chunk_size(n_rows, topk_total, bytes_per_entry, num_heads, head_dim_v):
@@ -188,7 +211,7 @@ def _row_chunk_size(n_rows, topk_total, bytes_per_entry, num_heads, head_dim_v):
     # the einsum consumes, and scores/weights over heads.
     latent = max(bytes_per_entry - 16, head_dim_v)
     per_row = topk_total * (bytes_per_entry + latent * 10 + num_heads * 8)
-    return max(1, min(n_rows, _ROW_CHUNK_BYTES // max(per_row, 1)))
+    return max(1, min(n_rows, _row_chunk_budget() // max(per_row, 1)))
 
 
 def _sparse_attend_rows(

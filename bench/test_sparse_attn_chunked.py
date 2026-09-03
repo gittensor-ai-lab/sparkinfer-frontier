@@ -21,15 +21,17 @@ HEADS = 8
 
 
 def run(cache, q, idx, lens, budget):
-    saved = M._ROW_CHUNK_BYTES
-    M._ROW_CHUNK_BYTES = budget
+    # Seed the cached budget so the forward slices by the amount this test wants
+    # rather than by whatever the device happens to have free.
+    saved = M._row_chunk_bytes
+    M._row_chunk_bytes = budget
     try:
         out, lse = M._sm120_sparse_decode_fwd(
             q.unsqueeze(1), cache, idx.unsqueeze(1), lens, None,
             KV_LORA_RANK, KV_LORA_RANK ** -0.5,
         )
     finally:
-        M._ROW_CHUNK_BYTES = saved
+        M._row_chunk_bytes = saved
     return out, lse
 
 
