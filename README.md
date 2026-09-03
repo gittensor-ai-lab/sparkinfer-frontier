@@ -37,6 +37,44 @@ much of that.
 exactly, in ~118 s end to end at ~1150 tok/s prefill
 (`bench/test_long_context.py`, 7/7 across depths 0.05-0.6 and lengths 32K-127K).
 
+It goes further than that. Verified needle recall, all at depth 0.5:
+
+| prompt | 128K | 256K | 512K |
+|---|---|---|---|
+| end to end | 118 s | 227 s | 456 s |
+| | pass | pass | pass |
+
+Prefill holds ~1125-1150 tok/s flat from 128K to 512K, so time is linear in
+prompt length and the sparse indexer is not the thing that degrades.
+
+**1M does not fit on this node.** The model would allow it -- GLM-5.3 declares
+`max_position_embeddings=1048576`, and being pure NoPE it has no RoPE
+extrapolation limit at all -- but the arithmetic does not:
+
+| | per GPU |
+|---|---:|
+| card | 31.36 GB |
+| NVFP4 weights | ~24.3 GB |
+| left for KV, state, activations, graphs | ~7.0 GB |
+| KV at 6.76 KB/token, 1M tokens | **7.1 GB** |
+
+1M needs the whole remainder for KV alone, leaving nothing to run in. The
+measured ceiling is **748,928 tokens** (`--mem-fraction-static 0.925`, 1.34 GB
+free), which prefills a 256K prompt correctly. Pushing to 0.95 does allocate
+859,648 tokens, and then OOMs on the first forward with 158 MiB free against a
+272 MiB request -- capacity that allocates but cannot be used.
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+EXTRA_ARGS="--mem-fraction-static 0.925 --mamba-full-memory-ratio 0.02 \
+            --max-running-requests 1 --cuda-graph-max-bs 2" \
+  bench/serve-glm53.sh tp8_sm120mla
+```
+
+Reaching a real 1M needs weights off these eight cards: TP=16 halves them and
+frees ~12 GB/GPU, or KV offload to the host's 503 GiB. Quantising further is not
+the lever -- the weights are already NVFP4 and the KV already fp8.
+
 Getting there turned up a correctness bug worth stating on its own, because it
 is invisible to every short test. Needle recall was failing reproducibly at
 depths 0.05 and 0.1 for prompts of 32K and up -- returning a confident near-miss
@@ -188,7 +226,8 @@ since an 8-way all-reduce moves `2(N-1)/N` of the data through shared host memor
 - Prefix caching is off, because a cache hit corrupts the KDA recurrent state;
   see **Long context**. Multi-turn and shared-prefix workloads pay full prefill.
 - Prefill is chunked at 2048, so a full 128K prompt costs ~110 s before the
-  first token. Trading KV back for KDA state raises concurrency and lowers it.
+  first token, and 512K about 456 s. Context past ~128K also means
+  `--max-running-requests 1`: the KV pool takes the memory concurrency needs.
 - Communication caps this box near 105 tok/s regardless of kernel work.
 
 ## Upstream bugs found
