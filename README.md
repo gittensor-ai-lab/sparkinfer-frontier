@@ -71,9 +71,34 @@ EXTRA_ARGS="--mem-fraction-static 0.925 --mamba-full-memory-ratio 0.02 \
   bench/serve-glm53.sh tp8_sm120mla
 ```
 
-Reaching a real 1M needs weights off these eight cards: TP=16 halves them and
-frees ~12 GB/GPU, or KV offload to the host's 503 GiB. Quantising further is not
-the lever -- the weights are already NVFP4 and the KV already fp8.
+**Host KV offload does not raise this.** It is the obvious idea -- the box has
+451 GiB of free host RAM -- but LMCache and HiCache are prefix-reuse tiers, not
+paging for a running sequence. `LMCRadixCache` subclasses `RadixCache`, and
+`--hicache-ratio` is documented as the host pool's size *relative to* the device
+pool, which it never enlarges. Measured with HiCache attached and an 8x host
+pool:
+
+```
+max_total_num_tokens = 193408          # identical to HiCache off
+Input length (254646 tokens) exceeds the maximum allowed length (193402 tokens)
+```
+
+Every token a sequence is currently attending over has to be resident on the
+GPU; the host tier only holds finished prefixes so a *later* request can reload
+them on a hit. On this model that reload is also the bug above -- with HiCache
+on, `test_prefix_cache.py` fails exactly as it did with the plain radix cache
+(cold `4817-QUARTZ-9930`, warm `4830`). So host tiering costs correctness here
+and buys no context.
+
+`--enable-unified-memory` is a different mechanism -- one buffer split
+dynamically between KV and KDA state rather than by a fixed ratio -- but it
+requires the Triton attention backend, and sm120 DSA needs
+`flashinfer_sparse_mla`. Its VMM arena reserves 256 GiB of *virtual* address
+space backed by device memory, not host memory.
+
+Reaching a real 1M means getting weights off these eight cards: TP=16 halves
+them and frees ~12 GB/GPU. Quantising further is not the lever -- the weights
+are already NVFP4 and the KV already fp8.
 
 Getting there turned up a correctness bug worth stating on its own, because it
 is invisible to every short test. Needle recall was failing reproducibly at
