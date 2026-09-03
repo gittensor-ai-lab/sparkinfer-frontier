@@ -286,13 +286,19 @@ Worth reporting to sgl-project/sglang regardless of hardware:
 5. `_resolve_kpool_tail_backend` tests `device_sm_major >= 10` and routes sm120
    to an sm100-only backend.
 6. A radix-cache prefix hit silently corrupts the KDA recurrent state on
-   `glm5_next`: the same prompt answers correctly on a cold cache and wrongly on
-   a hit. Every reachable strategy fails -- `extra_buffer`,
-   `extra_buffer_lazy`, `--mamba-max-states-per-path 1` and
-   `--enable-hierarchical-cache` -- and `no_buffer` cannot be selected at all,
-   since it requires `page_size=1` while the DSA kpool path requires 64. Silent,
-   and only reachable with prompts long enough to build a substantial cached
-   prefix. Reproducer: `bench/test_prefix_cache.py`.
+   `glm5_next`. Localized: a checkpoint donated by an **in-flight (chunked)**
+   request misresumes on a later partial hit, while a **finished**-request
+   checkpoint is exact -- measured, multi-turn reuse of a finished turn is
+   correct; reuse of a chunked donor's interior checkpoint is not. The clean fix
+   (donate only on finish) is blocked by a protocol coupling: `cache_unfinished_req`
+   re-matches a request's own just-inserted prefix to continue, and that
+   re-match requires the checkpoint to be present, so a request's continuation
+   and cross-request reuse cannot be separated without an upstream change.
+   Every reachable strategy fails -- `extra_buffer`, `extra_buffer_lazy`,
+   `--mamba-max-states-per-path 1`, `--enable-hierarchical-cache` -- and
+   `no_buffer` is unselectable (needs `page_size=1`; the DSA kpool needs 64).
+   Reproducer and full write-up: `bench/test_prefix_cache.py`,
+   `bench/PREFIX_CACHE_DEBUG.md`.
 
 ## Tests
 
@@ -306,4 +312,5 @@ Worth reporting to sgl-project/sglang regardless of hardware:
 | `bench/test_sparse_attn_chunked.py` | row slicing vs a single pass (fp-reassociation bound) |
 | `bench/test_long_context.py` | needle-in-a-haystack at 128K |
 | `bench/test_prefix_cache.py` | cache-hit answer vs cold-cache answer |
+| `bench/PREFIX_CACHE_DEBUG.md` | KDA prefix-cache corruption: root-cause diagnosis |
 | `bench/pcie_allreduce.py` | all-reduce strategies vs NCCL |

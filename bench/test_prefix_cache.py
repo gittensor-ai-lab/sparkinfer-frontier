@@ -37,10 +37,17 @@ FILLER = (
 HEAD = "You are reading an archived report. Answer questions about it.\n\n"
 
 
-def build(tok, target_tokens, depth, needle=NEEDLE):
+def build(tok, target_tokens, depth, needle=NEEDLE, needle_at=None):
     budget = target_tokens - len(tok(QUESTION + HEAD + needle).input_ids)
-    n = max(1, budget // len(tok(FILLER).input_ids))
-    at = int(n * depth)
+    per = len(tok(FILLER).input_ids)
+    n = max(1, budget // per)
+    if needle_at is not None:
+        # Approximate token offset -> filler repeat count. Coarse (one FILLER is
+        # ~per tokens) but enough to straddle a 2048 boundary across runs.
+        head_tok = len(tok(HEAD).input_ids)
+        at = max(0, min(n, round((needle_at - head_tok) / per)))
+    else:
+        at = int(n * depth)
     return HEAD + FILLER * at + needle + " " + FILLER * (n - at) + QUESTION
 
 
@@ -61,6 +68,14 @@ def generate(url, text, max_new_tokens=24):
     return (out["text"] if isinstance(out, dict) else out[0]["text"]).strip()
 
 
+def generate_ids(url, ids, max_new_tokens=24):
+    out = post(url, "/generate", {
+        "input_ids": ids,
+        "sampling_params": {"max_new_tokens": max_new_tokens, "temperature": 0.0},
+    })
+    return (out["text"] if isinstance(out, dict) else out[0]["text"]).strip()
+
+
 def flush(url):
     try:
         urllib.request.urlopen(
@@ -75,6 +90,20 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokens", type=int, default=131072)
     ap.add_argument("--depths", default="0.05,0.1,0.5")
+    # "shifted" primes with the needle moved deeper, so the prompts diverge at
+    # the needle and the hit resumes right at real branching. "same" primes with
+    # the identical prompt: any failure then indicts the state handoff itself,
+    # since the restored state encodes exactly what the warm run would compute.
+    ap.add_argument("--prime", choices=["shifted", "same"], default="shifted")
+    # Prime with exactly this many tokens of the warm prompt (token-level slice,
+    # sent as input_ids so the prefix is exact). Picks WHICH checkpoint the warm
+    # run restores: a multiple of 2048 makes the prime's deepest checkpoint the
+    # aligned final-state track, anything else the unaligned h track.
+    ap.add_argument("--prime-tokens", type=int, default=None)
+    # Place the needle at an exact token offset (overrides depth). Lets the
+    # branch point land on or off a 2048 chunk boundary, which selects whether
+    # the reused checkpoint is an aligned final state or an interior h state.
+    ap.add_argument("--needle-at", type=int, default=None)
     ap.add_argument("--model", default=os.environ.get("MODEL_PATH", "/root/models/glm53"))
     ap.add_argument("--url", default="http://127.0.0.1:30000")
     a = ap.parse_args()
@@ -86,14 +115,27 @@ def main() -> None:
     for depth in [float(d) for d in a.depths.split(",")]:
         prompt = build(tok, a.tokens, depth)
 
-        flush(a.url)
-        cold = generate(a.url, prompt)
+        if a.prime_tokens is not None:
+            # Exact-prefix priming: cold and warm both go in as token ids so the
+            # shared prefix is byte-for-byte the prime, not a re-tokenization.
+            ids = tok(prompt).input_ids
+            flush(a.url)
+            cold = generate_ids(a.url, ids)
+            flush(a.url)
+            generate_ids(a.url, ids[: a.prime_tokens], max_new_tokens=1)
+            warm = generate_ids(a.url, ids)
+        else:
+            flush(a.url)
+            cold = generate(a.url, prompt)
 
-        # Prime with the same needle placed later, so the two prompts share a
-        # long pure-filler prefix and the real request lands on a cache hit.
-        flush(a.url)
-        generate(a.url, build(tok, a.tokens, min(depth + 0.4, 0.95)), max_new_tokens=1)
-        warm = generate(a.url, prompt)
+            # Prime with the same needle placed later, so the two prompts share
+            # a long pure-filler prefix and the real request lands on a cache hit.
+            flush(a.url)
+            if a.prime == "same":
+                generate(a.url, prompt, max_new_tokens=1)
+            else:
+                generate(a.url, build(tok, a.tokens, min(depth + 0.4, 0.95)), max_new_tokens=1)
+            warm = generate(a.url, prompt)
 
         cold_ok, warm_ok = ANSWER in cold, ANSWER in warm
         # Only recall decides. Two runs of the same prompt need not be
