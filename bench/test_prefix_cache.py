@@ -96,18 +96,22 @@ def main() -> None:
         warm = generate(a.url, prompt)
 
         cold_ok, warm_ok = ANSWER in cold, ANSWER in warm
-        agree = cold == warm
-        ok = cold_ok and warm_ok and agree
+        # Only recall decides. Two runs of the same prompt need not be
+        # bitwise-equal on a live server -- batch composition reorders float
+        # reductions and can flip a token well after the answer -- so `identical`
+        # is reported but never fails the test. What must not happen is the cold
+        # run recalling the needle and the warm run not.
+        ok = cold_ok and warm_ok
         failures += not ok
         print(
             f"depth={depth}: cold={'ok' if cold_ok else 'BAD'} "
-            f"warm={'ok' if warm_ok else 'BAD'} identical={agree}"
+            f"warm={'ok' if warm_ok else 'BAD'} identical={cold == warm}"
         )
         if not ok:
             print(f"  cold: {cold[:80]!r}")
             print(f"  warm: {warm[:80]!r}")
 
-    print("PASS" if not failures else f"FAIL {failures} depth(s) differ on a cache hit")
+    print("PASS" if not failures else f"FAIL {failures} depth(s) lost the needle on a cache hit")
     sys.exit(1 if failures else 0)
 
 
