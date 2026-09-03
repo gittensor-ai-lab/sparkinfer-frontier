@@ -31,6 +31,49 @@ is hard to beat with a manual reduction). Per-token cost divides roughly as MoE
 23 ms, MLA attention 8 ms, all-reduce 9.5 ms measured eagerly -- graphs overlap
 much of that.
 
+## Long context
+
+128K runs, with one measured gap. A needle planted in a 127,316-token prompt is
+recalled exactly at most depths, in ~118 s end to end at ~1150 tok/s prefill
+(`bench/test_long_context.py`):
+
+| depth | 0.0 | 0.05 | 0.1 | 0.15 | 0.25 | 0.5 | 0.6 | 0.9 |
+|---|---|---|---|---|---|---|---|---|
+| 127K | pass | **fail** | **fail** | pass | pass | pass | pass | pass |
+
+The failures are reproducible, not flaky -- depth 0.1 fails on three separate
+runs at temperature 0, returning a plausible near-miss (`4831` for
+`4817-QUARTZ-9930`) rather than nothing. Holding depth at 0.1 and sweeping
+length puts the onset between 16K and 32K:
+
+| length @ depth 0.1 | 16K | 32K | 64K | 127K |
+|---|---|---|---|---|
+| | pass | **fail** | **fail** | **fail** |
+
+So it is neither a pure fraction nor a pure absolute-position effect: 19K tokens
+deep at 127K (depth 0.15) is recalled while 13K deep (depth 0.1) is not, and the
+very first tokens always survive. That shape -- beginning retained, a band just
+after it lost, everything later retained -- is what a sparse index that always
+keeps the attention sink and the recent window looks like, but it is equally
+consistent with the 34 KDA layers' recurrent state. Which of the two, or whether
+the NoPE reference contributes, is not yet isolated; it needs a comparison
+against the same checkpoint on hardware where the vendor kernels run.
+
+Two things had to change to get here. GLM-5.3 splits one memory budget between 34 KDA
+layers' recurrent state and 11 MLA layers' paged KV; `--mamba-full-memory-ratio`
+defaults to 0.9, which reserves most of it for KDA state and buys concurrency
+nobody asked for on a box like this. At 0.25 the KV pool goes from 127,296 to
+**193,408 tokens**, and `max_mamba_cache_size` falls from 43 to 17.
+
+The other was mine. The NoPE attention reference gathered every query row's
+top-k entries and upcast them in one allocation: at a 2048-row prefill chunk
+with `index_topk=2048` that is 4.2M rows x 512 x 4 B = 8 GiB for the dequant
+alone, ~17 GB peak, and all eight ranks OOMed. Short prompts never reached it
+because the sequence was shorter than the top-k budget, so every earlier test
+passed. Rows are independent given their own indices, so the forward now runs in
+slices sized to a byte budget, with the slice count derived from shapes so graph
+capture stays sync-free.
+
 ## The node
 
 | | |
@@ -133,6 +176,10 @@ since an 8-way all-reduce moves `2(N-1)/N` of the data through shared host memor
   version worth writing.
 - Long greedy decodes show phrase-level repetition. Short answers, facts,
   arithmetic and chain-of-thought are correct.
+- A reproducible recall gap sits ~5-10% into contexts of 32K and above; see
+  **Long context**. Unattributed as yet.
+- Prefill is chunked at 2048, so a full 128K prompt costs ~110 s before the
+  first token. Trading KV back for KDA state raises concurrency and lowers it.
 - Communication caps this box near 105 tok/s regardless of kernel work.
 
 ## Upstream bugs found
@@ -161,4 +208,6 @@ Worth reporting to sgl-project/sglang regardless of hardware:
 | `bench/test_nvfp4_dequant.py` | expert dequantisation from the checkpoint |
 | `bench/test_gather_roundtrip.py` | KV gather vs SGLang's own writer |
 | `bench/test_sparse_attn.py` | sparse attention vs fp32 reference |
+| `bench/test_sparse_attn_chunked.py` | row slicing vs a single pass (fp-reassociation bound) |
+| `bench/test_long_context.py` | needle-in-a-haystack at 128K |
 | `bench/pcie_allreduce.py` | all-reduce strategies vs NCCL |
