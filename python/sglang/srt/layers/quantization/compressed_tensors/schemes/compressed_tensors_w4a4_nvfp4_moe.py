@@ -281,6 +281,12 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        # Neither runner works on consumer Blackwell: TRT-LLM FP4 is sm100-only and
+        # the CUTLASS path reads the ModelOpt layout, returning NaN for a
+        # compressed-tensors checkpoint. Fall back to a dequantising reference.
+        self.use_sm120_ref = get_platform().is_sm120
+        if self.use_sm120_ref:
+            return
         if self.use_flashinfer_trtllm:
             import sglang.srt.layers.moe.moe_runner.flashinfer_trtllm  # noqa: F401 – triggers @register_fused_func
 
@@ -301,6 +307,31 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
     ) -> CombineInput:
 
         x = dispatch_output.hidden_states
+
+        if self.use_sm120_ref:
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+            from sglang.srt.layers.quantization.compressed_tensors.sm120_nvfp4_moe_ref import (
+                sm120_nvfp4_moe_forward,
+            )
+
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+            return StandardCombineInput(
+                hidden_states=sm120_nvfp4_moe_forward(
+                    x=x,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    w13_weight=layer.w13_weight,
+                    w13_weight_scale=layer.w13_weight_scale,
+                    w13_weight_scale_2=layer.w13_weight_scale_2,
+                    w2_weight=layer.w2_weight,
+                    w2_weight_scale=layer.w2_weight_scale,
+                    w2_weight_scale_2=layer.w2_weight_scale_2,
+                    activation=self.moe_runner_config.activation,
+                    apply_router_weight_on_input=(
+                        self.moe_runner_config.apply_router_weight_on_input
+                    ),
+                )
+            )
 
         if self.use_flashinfer_trtllm:
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (

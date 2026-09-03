@@ -114,6 +114,12 @@ case "$MODE" in
                       --dsa-prefill-backend flashinfer_sparse_mla
                       --dsa-decode-backend flashinfer_sparse_mla
                       --moe-runner-backend marlin
+                      # The routed experts are NVFP4 but the shared expert stays
+                      # BF16 (the quant config's ignore list), so fusing it into
+                      # expert slot n_routed_experts leaves that slot without
+                      # weight_packed/weight_scale/weight_global_scale. The zero
+                      # global scale then becomes inf via 1/x and NaNs the layer.
+                      --disable-shared-experts-fusion
                       --disable-cuda-graph) ;;
   tp8_tilelang)
                export SGLANG_ENABLE_JIT_DEEPGEMM=0
