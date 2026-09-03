@@ -1,14 +1,27 @@
 # Frontier models on 8x RTX 5090
 
-Running **GLM-5.3-Flash (NVFP4)** on eight consumer RTX 5090s, from a fork of
-[SGLang](https://github.com/sgl-project/sglang).
+**GLM-5.3-Flash (NVFP4)** — 320B total, 18B active — serving at **34 tok/s** on
+eight consumer RTX 5090s. A fork of [SGLang](https://github.com/sgl-project/sglang).
 
 ```
-"Q: What is 15 times 4?"                    ->  "15 times 4 is 60."
-"Q: Name the largest planet..."             ->  "Jupiter is the largest planet in our solar system."
-"Q: Who wrote Romeo and Juliet?"            ->  "Romeo and Juliet was written by William Shakespeare."
-"The sky appears blue because sunlight..."  ->  "...is scattered by the atmosphere."
+"Q: What is 15 times 4?"          ->  " 15 times 4 is 60."
+"Q: Name the largest planet..."   ->  " Jupiter is the largest planet in our solar system."
+"Q: Who wrote Romeo and Juliet?"  ->  " Romeo and Juliet was written by William Shakespeare."
+"Why is the sky blue?"            ->  " ...sunlight is scattered by the atmosphere."
 ```
+
+No datacenter GPU, no NVLink, no P2P.
+
+## Where the performance came from
+
+| stage | tok/s | change |
+|---|---:|---|
+| per-expert reference | 2.5 | one kernel launch per expert, ~90 per layer |
+| grouped MoE | 6.0 | two grouped GEMMs per layer, however many experts fire |
+| **+ CUDA graphs** | **34.1** | capture across 45 layers x 8 ranks |
+
+16 tokens in 469 ms warm. Communication bounds this box near 105 tok/s, so about
+3x of headroom remains and attention is what is consuming it.
 
 ## The node
 
@@ -17,107 +30,99 @@ Running **GLM-5.3-Flash (NVFP4)** on eight consumer RTX 5090s, from a fork of
 | GPUs | 8x RTX 5090 (sm120), 32 GB each, 256 GB total |
 | Interconnect | PCIe Gen4 x16, **no P2P** (CNS on all 28 pairs), dual NUMA |
 | Host | 2x EPYC 7K62, 192 threads, 503 GiB RAM |
-| Model | `RedHatAI/GLM-5.3-Flash-NVFP4` -- 320B total / 18B active, 185 GiB |
+| Model | `RedHatAI/GLM-5.3-Flash-NVFP4`, 185 GiB |
 | Residency | 24.8 GB per GPU, ~62 s to load |
 
 ## Run it
 
 ```bash
-bench/serve-glm53.sh tp8_sm120mla     # TP=8, sm120 sparse MLA, NVFP4 MoE
+bench/serve-glm53.sh tp8_sm120mla     # serve: TP=8, sm120 sparse MLA, NVFP4 MoE
 bench/bench-glm53.sh tp8_sm120mla     # latency + throughput
-bench/bench_allreduce.py              # torchrun --nproc_per_node=8
 ```
 
 `serve-glm53.sh` carries every workaround below, each commented with the failure
-it prevents.
+it prevents. The first request after a restart pays ~14 s of Triton JIT.
 
-## What it took
-
-Five things had to be fixed before this model produced a correct token on sm120.
+## What it took to run at all
 
 **Toolchain.** The image ships nvcc 12.8 but SM 12.x needs >= 12.9, so every JIT
 kernel failed. `nvidia-cuda-nvcc-cu13` supplies 13.3, which then mismatches the
 13.0 runtime headers (CCCL hard-errors), needing
-`-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK`, plus a `libcudart.so` soname symlink.
+`-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK` and a `libcudart.so` soname symlink.
 
 **Shared-expert fusion.** The routed experts are NVFP4 but the shared expert
 stays BF16, and the loader fuses it into expert slot `n_routed_experts` anyway.
 That slot receives no scale, so `1/weight_global_scale` is `inf` and `inf * 0`
-NaNs the whole layer. Every MoE backend read that poisoned scale, which is why
-all of them failed on healthy weights. `--disable-shared-experts-fusion` is the
-fix, and this is **not** sm120-specific.
+NaNs the layer. Every MoE backend read that poisoned scale, which is why all of
+them failed on weights that measured healthy. `--disable-shared-experts-fusion`
+is the fix, and this is **not** sm120-specific — the same checkpoint breaks on
+Hopper.
 
 **NoPE sparse MLA.** GLM-5.3 is `qk_rope_head_dim=0`; the compiled sm120
 sparse-MLA kernel is shaped for `512 + rope 64` and misses on geometry, not on
-dispatch. The NoPE route falls back to a layout-independent reference, fed by a
+dispatch. The NoPE route falls back to a layout-independent reference fed by a
 flat-latent gather for `DSATokenToKVPool`'s 528 B rows (512 FP8 + 4 FP32 block
 scales).
 
-**NVFP4 MoE.** TRT-LLM FP4 is sm100-only and FlashInfer CUTLASS reads the
-ModelOpt layout, so `sm120_nvfp4_moe_ref.py` dequantises and runs a grouped GEMM.
-
 **Tensor-parallel deadlock.** `x[mask] = 0` sizes its write on the host, which
-desynchronises ranks and hangs NCCL at 0% GPU with no error. `masked_fill` is
-the sync-free form. The same sync deadlocks CUDA-graph capture, so this path
-runs eager.
+desynchronises ranks and hangs NCCL at 0% GPU with no error at all. `masked_fill`
+is the sync-free form.
+
+**Runner responsibilities.** Replacing a MoE runner means taking on everything it
+did. Two config-driven behaviours are easy to miss, and both degrade output while
+leaving short answers correct: `swiglu_limit` (10.0, clamps both SwiGLU halves)
+and `routed_scaling_factor` (2.5, scales the combined routed output).
 
 ## Kernels
 
-`sm120_nvfp4_moe_triton.py` is a fused NVFP4 GEMM: it unpacks the e2m1 nibbles
-and applies the per-group FP8 scale inside the matmul, so expert weights are read
-once at 4 bits and never materialised in bfloat16. Tiles are 64x64x64, sized for
-sm120's 99 KB of shared memory rather than sm100's 228 KB.
+`sm120_nvfp4_moe_triton.py` fuses NVFP4 dequantisation into the GEMM: e2m1
+nibbles are unpacked and per-group FP8 scales applied inside the matmul, so
+weights are read once at 4 bits and never materialised in bfloat16. Tiles are
+64x64x64 for sm120's 99 KB of shared memory, against sm100's 228 KB.
 
-`sm120_nvfp4_moe_fused.py` then removes the per-expert launch: `moe_align_block_size`
-sorts the routed (token, expert) pairs so a block owns 64 rows sharing one expert,
-and the whole MoE becomes **two grouped GEMMs** instead of two launches per expert.
+`sm120_nvfp4_moe_fused.py` removes the per-expert launch. `moe_align_block_size`
+sorts routed (token, expert) pairs so a block owns 64 rows sharing one expert,
+making the MoE two grouped GEMMs regardless of how many experts fire.
 
-Against the per-expert reference at GLM-5.3 shapes, 288 experts / top-8
-(`bench/test_moe_fused.py`), matching it exactly:
+Against the per-expert reference at GLM-5.3 shapes, 288 experts / top-8, matching
+it exactly (`bench/test_moe_fused.py`):
 
 | tokens | experts hit | reference | fused | |
-|---|---|---|---|---|
-| 1 | 8 | 3.84 ms | 0.65 ms | **5.9x** |
-| 8 | 62 | 28.23 ms | 0.87 ms | **32.5x** |
-| 32 | 166 | 75.57 ms | 1.66 ms | **45.4x** |
-| 128 | 280 | 129.16 ms | 2.50 ms | **51.7x** |
+|---:|---:|---:|---:|---|
+| 1 | 8 | 3.74 ms | 0.56 ms | **6.6x** |
+| 8 | 62 | 27.54 ms | 0.63 ms | **43.5x** |
+| 32 | 166 | 73.85 ms | 2.16 ms | **34.2x** |
+| 128 | 280 | 125.70 ms | 2.97 ms | **42.4x** |
 
-End to end that is **2.5 -> 6.0 tok/s** (16 tokens in 2.65 s, warm; the first
-request pays Triton JIT). Re-enabling CUDA graphs on top takes it to
-**34.1 tok/s** -- decode is launch-bound over 45 layers x 8 ranks, so capture is
-worth more than any single kernel. Graphs need every host sync gone: `masked_fill`
-instead of boolean-index assignment in the NoPE attention, and a fixed-shape
-scatter in the MoE (boolean-mask indexing has a data-dependent extent).
+The single GEMM underneath is 3.4x at decode shapes
+(`bench/test_nvfp4_gemm.py`). Read the global scale from a device pointer, not
+`float(tensor)` — the latter syncs once per expert, ~90 times per layer.
 
-The single GEMM underneath (`bench/test_nvfp4_gemm.py`), against
-`dequantize_nvfp4` + `torch.matmul` on identical packed weights:
+CUDA graphs need every host sync gone from decode. Boolean-mask indexing is the
+trap: `y[valid]` has a data-dependent extent, so PyTorch syncs to size it. Mask
+to zero and scatter every row instead.
 
-| M | N | K | rel err | dequant+matmul | fused | |
-|---|---|---|---|---|---|---|
-| 64 | 512 | 4096 | 0.0024 | 0.298 ms | 0.087 ms | **3.42x** |
-| 256 | 512 | 4096 | 0.0043 | 0.297 ms | 0.087 ms | **3.41x** |
-| 1024 | 4096 | 2048 | 0.0030 | 0.382 ms | 0.303 ms | 1.26x |
+## Communication
 
-Small M is the case that matters: each expert only sees the tokens routed to it.
-The global scale is read from a device pointer inside the kernel -- passing it as
-a Python float syncs once per expert, roughly 90 times per layer.
+NCCL, unmodified. `bench/pcie_allreduce.py` measures why:
+
+| strategy | vs NCCL |
+|---|---|
+| NUMA-hierarchical | **1.5-3x slower** — NCCL already reduces topology-aware |
+| FP8 inter-group hop | slower still — quantise kernels cost more than bytes saved |
+| reduce_scatter + FP8 all_gather | 1.07x, at 4.5e-2 relative error |
+
+An 8 KiB all-reduce costs ~106 us and 64 MiB reaches 3.3 GB/s. That is much
+closer to the practical ceiling than PCIe Gen4's ~25 GB/s per-GPU figure suggests,
+since an 8-way all-reduce moves `2(N-1)/N` of the data through shared host memory.
 
 ## Known limitations
 
-- End to end is **34.1 tok/s** (16 tokens in 469 ms, warm) against 2.5 tok/s
-  before this work, a 13.6x gain. Attention is still the unfused NoPE reference,
-  which materialises `[tokens, heads, 2051, 512]` in fp32 per layer -- **fusing
-  it is the next win**. Communication bounds this box near 105 tok/s.
-- Long greedy decodes still show phrase-level repetition. Short answers, facts,
+- Attention is still the unfused NoPE reference, materialising
+  `[tokens, heads, 2051, 512]` in fp32 per layer. **Fusing it is the next win.**
+- Long greedy decodes show phrase-level repetition. Short answers, facts,
   arithmetic and chain-of-thought are correct.
-- Communication costs ~106 us for an 8 KiB all-reduce and 3.3 GB/s at 64 MiB,
-  which bounds decode near 105 tok/s before any compute. NCCL is used as-is:
-  `bench/pcie_allreduce.py` measures a NUMA-hierarchical variant (1.5-3x
-  **slower** -- NCCL already reduces topology-aware) and reduce_scatter + FP8
-  all_gather (1.07x faster, 4.5e-2 relative error, a poor trade). The 3.3 GB/s
-  figure is much closer to the practical ceiling than PCIe's 25 GB/s per-GPU
-  number suggests, since an 8-way all-reduce moves 2(N-1)/N of the data through
-  shared host memory.
+- Communication caps this box near 105 tok/s regardless of kernel work.
 
 ## Upstream bugs found
 
@@ -127,18 +132,22 @@ Worth reporting to sgl-project/sglang regardless of hardware:
    expert's quantisation differs from the routed experts'.
 2. `process_weights_after_loading` should never emit `inf` from
    `1/weight_global_scale`.
-3. `routed_scaling_factor` is applied by nobody for compressed-tensors NVFP4
-   MoE: top-k does not fold it in (the method is not in
+3. `routed_scaling_factor` is applied by nobody for compressed-tensors NVFP4 MoE:
+   top-k does not fold it in (the method is absent from
    `_fuses_routed_scaling_factor_in_topk`) and the scheme passes
    `apply_routed_scaling_factor=False` to the CUTLASS runner.
 4. `glm5_next` declares no `hf_to_sglang_mapper`, so the compressed-tensors
-   ignore list never gets rewritten and startup fails on any hardware.
+   ignore list is never rewritten and startup fails on any hardware.
 5. `_resolve_kpool_tail_backend` tests `device_sm_major >= 10` and routes sm120
    to an sm100-only backend.
 
 ## Tests
 
-`bench/test_gather_roundtrip.py` and `bench/test_sparse_attn.py` check the sm120
-attention path against fp32 references (3.3% and 4.5% max relative error, both
-FP8 rounding). `bench/test_nvfp4_dequant.py` checks expert dequantisation
-straight from the checkpoint.
+| | |
+|---|---|
+| `bench/test_moe_fused.py` | grouped MoE vs per-expert reference (exact) |
+| `bench/test_nvfp4_gemm.py` | fused GEMM vs dequantise + matmul |
+| `bench/test_nvfp4_dequant.py` | expert dequantisation from the checkpoint |
+| `bench/test_gather_roundtrip.py` | KV gather vs SGLang's own writer |
+| `bench/test_sparse_attn.py` | sparse attention vs fp32 reference |
+| `bench/pcie_allreduce.py` | all-reduce strategies vs NCCL |
