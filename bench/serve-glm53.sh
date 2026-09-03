@@ -122,7 +122,13 @@ case "$MODE" in
                       # Without these the chat template's raw </think> and tool
                       # syntax leak into message.content.
                       --reasoning-parser glm45
-                      --tool-call-parser glm47) ;;
+                      --tool-call-parser glm47
+                      # GLM-5.3 is hybrid: 34 KDA layers need a recurrent state
+                      # pool, 11 MLA layers need paged KV, and both come out of
+                      # one budget. The 0.9 default reserves most of it for KDA
+                      # state -- 43 concurrent sequences -- which starves KV and
+                      # caps context. This box serves few streams and long ones.
+                      --mamba-full-memory-ratio 0.25) ;;
   tp8_tilelang)
                export SGLANG_ENABLE_JIT_DEEPGEMM=0
                # bfloat16 must be explicit: `auto` resolves to fp8_e4m3 on Blackwell,

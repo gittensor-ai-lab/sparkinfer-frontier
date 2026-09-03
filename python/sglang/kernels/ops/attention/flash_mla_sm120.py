@@ -174,6 +174,76 @@ def _gather_and_dequant(k_cache, indices, page_size):
     return result.reshape(*idx_shape, _D)
 
 
+# Working-set budget for one slice of query rows. The gather materialises
+# topk entries per row and upcasts them to fp32, so a full 2048-row prefill
+# chunk at index_topk=2048 asks for ~17 GB and OOMs a 32 GB card. Rows are
+# independent given their own indices, so the forward runs in slices.
+_ROW_CHUNK_BYTES = 512 << 20
+
+
+def _row_chunk_size(n_rows, topk_total, bytes_per_entry, num_heads, head_dim_v):
+    """Rows per slice, derived from shapes alone so graph capture stays sync-free."""
+    # Per row: the fp8 gather, its fp32 dequant and bf16 result, the fp32 copy
+    # the einsum consumes, and scores/weights over heads.
+    latent = max(bytes_per_entry - 16, head_dim_v)
+    per_row = topk_total * (bytes_per_entry + latent * 10 + num_heads * 8)
+    return max(1, min(n_rows, _ROW_CHUNK_BYTES // max(per_row, 1)))
+
+
+def _sparse_attend_rows(
+    q_rows,
+    k_cache,
+    page_size,
+    indices_rows,
+    invalid_rows,
+    extra_k_cache,
+    extra_page_size,
+    extra_indices_rows,
+    attn_sink,
+    head_dim_v,
+    softmax_scale,
+):
+    """Attention over a slice of independent query rows: (N, H, D) against (N, T)."""
+    H_q = q_rows.shape[1]
+    gathered_kv = _gather_and_dequant(k_cache, indices_rows, page_size)
+
+    if extra_indices_rows is not None:
+        extra_kv = _gather_and_dequant(
+            extra_k_cache, extra_indices_rows, extra_page_size
+        )
+        gathered_kv = torch.cat([gathered_kv, extra_kv], dim=1)
+
+    # masked_fill, not gathered_kv[mask] = 0: boolean-index assignment syncs to
+    # host to size the write, which deadlocks the TP collectives.
+    gathered_kv = gathered_kv.masked_fill(invalid_rows.unsqueeze(-1), 0.0)
+
+    kv_f = gathered_kv.float()
+    kv_d = kv_f.shape[-1]
+    q_f = q_rows.float()
+    if q_f.shape[-1] != kv_d:
+        q_f = q_f[..., :kv_d]
+
+    scores = torch.einsum("nhd,ntd->nht", q_f, kv_f) * softmax_scale
+    scores.masked_fill_(invalid_rows.unsqueeze(1).expand_as(scores), float("-inf"))
+
+    lse = torch.logsumexp(scores, dim=-1)
+
+    if attn_sink is not None:
+        lse_for_out = torch.logsumexp(
+            torch.stack([lse, attn_sink.view(1, H_q).expand_as(lse)], dim=0), dim=0
+        )
+    else:
+        lse_for_out = lse.clone()
+
+    lonely = lse == float("-inf")
+    lse_for_out = lse_for_out.masked_fill(lonely, float("inf"))
+    weights = torch.exp(scores - lse_for_out.unsqueeze(-1))
+    out = torch.einsum("nht,ntv->nhv", weights, kv_f[..., :head_dim_v])
+    out = out.masked_fill(lonely.unsqueeze(-1), 0.0)
+
+    return out.to(torch.bfloat16), lse
+
+
 def _sm120_sparse_decode_fwd(
     q,
     k_cache,
@@ -203,9 +273,10 @@ def _sm120_sparse_decode_fwd(
         topk_range = torch.arange(topk, device=topk_length.device).view(1, 1, topk)
         invalid_mask = invalid_mask | (topk_range >= topk_length.view(B, 1, 1))
 
-    # Gather and dequantize using page-aware addressing
-    gathered_kv = _gather_and_dequant(k_cache, safe_indices, page_size)
-
+    extra_safe = None
+    extra_invalid = None
+    extra_page_size = None
+    topk_total = topk
     if extra_k_cache is not None and extra_indices is not None:
         extra_topk = extra_indices.shape[-1]
         extra_page_size = extra_k_cache.shape[1]
@@ -218,39 +289,42 @@ def _sm120_sparse_decode_fwd(
             extra_invalid = extra_invalid | (
                 extra_range >= extra_topk_length.view(B, 1, 1)
             )
-        extra_kv = _gather_and_dequant(extra_k_cache, extra_safe, extra_page_size)
-        gathered_kv = torch.cat([gathered_kv, extra_kv], dim=2)
         invalid_mask = torch.cat([invalid_mask, extra_invalid], dim=2)
+        topk_total += extra_topk
 
-    # masked_fill, not gathered_kv[mask] = 0: boolean-index assignment syncs to
-    # host to size the write, which deadlocks the TP collectives.
-    gathered_kv = gathered_kv.masked_fill(invalid_mask.unsqueeze(-1), 0.0)
+    # (B, s_q) are both row dimensions here -- the NoPE caller passes tokens in B
+    # with s_q=1 -- so flatten them and slice uniformly over the result.
+    n_rows = B * s_q
+    q_rows = q.reshape(n_rows, H_q, D_qk)
+    idx_rows = safe_indices.reshape(n_rows, topk)
+    invalid_rows = invalid_mask.reshape(n_rows, topk_total)
+    extra_rows = None if extra_safe is None else extra_safe.reshape(n_rows, -1)
 
-    q_f = q.float()
-    kv_f = gathered_kv.float()
-    kv_d = kv_f.shape[-1]
-    if D_qk != kv_d:
-        q_f = q_f[..., :kv_d]
+    step = _row_chunk_size(n_rows, topk_total, bpt, H_q, head_dim_v)
+    out = torch.empty(
+        (n_rows, H_q, head_dim_v), dtype=torch.bfloat16, device=q.device
+    )
+    lse = torch.empty((n_rows, H_q), dtype=torch.float32, device=q.device)
 
-    scores = torch.einsum("bshd,bstd->bsht", q_f, kv_f) * softmax_scale
-    scores.masked_fill_(invalid_mask.unsqueeze(2).expand_as(scores), float("-inf"))
-
-    lse = torch.logsumexp(scores, dim=-1)
-
-    if attn_sink is not None:
-        lse_for_out = torch.logsumexp(
-            torch.stack([lse, attn_sink.view(1, 1, H_q).expand_as(lse)], dim=0), dim=0
+    for start in range(0, n_rows, step):
+        stop = min(start + step, n_rows)
+        out[start:stop], lse[start:stop] = _sparse_attend_rows(
+            q_rows[start:stop],
+            k_cache,
+            page_size,
+            idx_rows[start:stop],
+            invalid_rows[start:stop],
+            extra_k_cache,
+            extra_page_size,
+            None if extra_rows is None else extra_rows[start:stop],
+            attn_sink,
+            head_dim_v,
+            softmax_scale,
         )
-    else:
-        lse_for_out = lse.clone()
 
-    lonely = lse == float("-inf")
-    lse_for_out = lse_for_out.masked_fill(lonely, float("inf"))
-    weights = torch.exp(scores - lse_for_out.unsqueeze(-1))
-    out = torch.einsum("bsht,bstv->bshv", weights, kv_f[..., :head_dim_v])
-    out = out.masked_fill(lonely.unsqueeze(-1), 0.0)
-
-    return out.to(torch.bfloat16), lse.permute(0, 2, 1)
+    out = out.reshape(B, s_q, H_q, head_dim_v)
+    lse = lse.reshape(B, s_q, H_q)
+    return out, lse.permute(0, 2, 1)
 
 
 # SM120 FlashMLA: default FlashInfer (CUTLASS SM120 sparse MLA decode).
