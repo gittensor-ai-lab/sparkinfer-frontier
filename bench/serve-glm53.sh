@@ -101,11 +101,10 @@ case "$MODE" in
                # Leave SGLANG_SM120_FLASHMLA_BACKEND at flashinfer: with
                # sparse_mla_top_k_lens supplied for NoPE, the real CUTLASS sm120
                # kernel is usable, and the torch fallback is orders slower.
-               # The NoPE reference path does a boolean-mask assignment
-               # (gathered_kv[invalid_mask] = 0), which forces a device-to-host
-               # sync and deadlocks inside CUDA-graph capture -- the server hangs
-               # at 0% GPU rather than erroring. Eager decode is required until a
-               # capturable kernel replaces it.
+               # CUDA graphs are on: the host syncs that used to deadlock capture
+               # are gone -- masked_fill replaced the boolean-index assignments in
+               # the NoPE attention, and the MoE scatter masks to zero instead of
+               # boolean-indexing a data-dependent extent.
                # The Triton MoE runner has no NVFP4 path at all -- only
                # flashinfer_cutlass and flashinfer_trtllm implement W4A4, and
                # trtllm targets sm100. Routing NVFP4 experts through triton
@@ -123,8 +122,7 @@ case "$MODE" in
                       # Without these the chat template's raw </think> and tool
                       # syntax leak into message.content.
                       --reasoning-parser glm45
-                      --tool-call-parser glm47
-                      --disable-cuda-graph) ;;
+                      --tool-call-parser glm47) ;;
   tp8_tilelang)
                export SGLANG_ENABLE_JIT_DEEPGEMM=0
                # bfloat16 must be explicit: `auto` resolves to fp8_e4m3 on Blackwell,

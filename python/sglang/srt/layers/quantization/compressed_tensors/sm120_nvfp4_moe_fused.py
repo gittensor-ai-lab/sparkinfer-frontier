@@ -79,15 +79,19 @@ def sm120_nvfp4_moe_fused(
     # Scatter the sorted rows back onto their tokens, weighted by the router.
     out = torch.zeros((num_tokens, hidden), dtype=torch.bfloat16, device=x.device)
     # sorted_ids is longer than num_valid and its tail is uninitialised, so bound
-    # both ends: negative garbage would otherwise pass an upper-bound-only test
-    # and index backwards.
+    # both ends: negative garbage would otherwise index backwards.
     valid = (sorted_ids >= 0) & (sorted_ids < num_tokens * top_k)
-    rows = sorted_ids[valid]
-    contrib = y[valid]
+    # Keep the shape static. Boolean-mask indexing (y[valid]) has a
+    # data-dependent extent, which forces a device-to-host sync and cannot be
+    # captured in a CUDA graph; masking to zero and scattering every row costs
+    # the padded rows but stays capturable.
+    safe = torch.where(valid, sorted_ids, torch.zeros_like(sorted_ids)).to(torch.int64)
+    keep = valid.unsqueeze(-1).to(y.dtype)
+    contrib = y * keep
     if not apply_router_weight_on_input:
-        w = topk_weights.reshape(-1)[rows].unsqueeze(-1).to(contrib.dtype)
+        w = topk_weights.reshape(-1)[safe].unsqueeze(-1).to(contrib.dtype)
         contrib = contrib * w
-    out.index_add_(0, (rows // top_k).to(torch.int64), contrib)
+    out.index_add_(0, safe // top_k, contrib)
 
     if routed_scaling_factor is not None:
         out = out * routed_scaling_factor

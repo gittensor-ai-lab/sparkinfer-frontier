@@ -83,7 +83,11 @@ Against the per-expert reference at GLM-5.3 shapes, 288 experts / top-8
 | 128 | 280 | 129.16 ms | 2.50 ms | **51.7x** |
 
 End to end that is **2.5 -> 6.0 tok/s** (16 tokens in 2.65 s, warm; the first
-request pays Triton JIT).
+request pays Triton JIT). Re-enabling CUDA graphs on top takes it to
+**34.1 tok/s** -- decode is launch-bound over 45 layers x 8 ranks, so capture is
+worth more than any single kernel. Graphs need every host sync gone: `masked_fill`
+instead of boolean-index assignment in the NoPE attention, and a fixed-shape
+scatter in the MoE (boolean-mask indexing has a data-dependent extent).
 
 The single GEMM underneath (`bench/test_nvfp4_gemm.py`), against
 `dequantize_nvfp4` + `torch.matmul` on identical packed weights:
@@ -100,10 +104,10 @@ a Python float syncs once per expert, roughly 90 times per layer.
 
 ## Known limitations
 
-- End to end is **6.0 tok/s** (16 tokens in 2.65 s, warm). CUDA graphs are still
-  off because the NoPE attention reference does a host sync, and attention is
-  unfused. **A capturable attention path is the next win** now that the MoE is
-  grouped.
+- End to end is **34.1 tok/s** (16 tokens in 469 ms, warm) against 2.5 tok/s
+  before this work, a 13.6x gain. Attention is still the unfused NoPE reference,
+  which materialises `[tokens, heads, 2051, 512]` in fp32 per layer -- **fusing
+  it is the next win**. Communication bounds this box near 105 tok/s.
 - Long greedy decodes still show phrase-level repetition. Short answers, facts,
   arithmetic and chain-of-thought are correct.
 - Communication costs ~106 us for an 8 KiB all-reduce and 3.3 GB/s at 64 MiB,
