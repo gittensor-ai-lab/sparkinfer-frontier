@@ -1,6 +1,6 @@
 # Frontier models on 8x RTX 5090
 
-**GLM-5.3-Flash (NVFP4)** — 320B total, 18B active — serving at **34 tok/s** on
+**GLM-5.3-Flash (NVFP4)** — 320B total, 18B active — serving at **37 tok/s** on
 eight consumer RTX 5090s. A fork of [SGLang](https://github.com/sgl-project/sglang).
 
 ```
@@ -89,18 +89,19 @@ weights are read once at 4 bits and never materialised in bfloat16. Tiles are
 64x64x64 for sm120's 99 KB of shared memory, against sm100's 228 KB.
 
 `sm120_nvfp4_moe_fused.py` removes the per-expert launch. `moe_align_block_size`
-sorts routed (token, expert) pairs so a block owns 64 rows sharing one expert,
-making the MoE two grouped GEMMs regardless of how many experts fire.
+sorts routed (token, expert) pairs so a block owns one expert's rows, making the
+MoE two grouped GEMMs regardless of how many experts fire. The row tile is 16/32/64
+by batch, since every expert is padded up to a whole block.
 
 Against the per-expert reference at GLM-5.3 shapes, 288 experts / top-8, matching
 it exactly (`bench/test_moe_fused.py`):
 
 | tokens | experts hit | reference | fused | |
 |---:|---:|---:|---:|---|
-| 1 | 8 | 3.74 ms | 0.56 ms | **6.6x** |
-| 8 | 62 | 27.54 ms | 0.63 ms | **43.5x** |
-| 32 | 166 | 73.85 ms | 2.16 ms | **34.2x** |
-| 128 | 280 | 125.70 ms | 2.97 ms | **42.4x** |
+| 1 | 8 | 3.90 ms | 0.59 ms | **6.6x** |
+| 8 | 62 | 29.00 ms | 0.59 ms | **49.2x** |
+| 32 | 166 | 76.70 ms | 1.42 ms | **54.1x** |
+| 128 | 280 | 129.47 ms | 2.96 ms | **43.7x** |
 
 The single GEMM underneath is 3.4x at decode shapes
 (`bench/test_nvfp4_gemm.py`). Read the global scale from a device pointer, not
