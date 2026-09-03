@@ -33,33 +33,42 @@ much of that.
 
 ## Long context
 
-128K runs, with one measured gap. A needle planted in a 127,316-token prompt is
-recalled exactly at most depths, in ~118 s end to end at ~1150 tok/s prefill
-(`bench/test_long_context.py`):
+128K works. A needle planted anywhere in a 127,316-token prompt comes back
+exactly, in ~118 s end to end at ~1150 tok/s prefill
+(`bench/test_long_context.py`, 7/7 across depths 0.05-0.6 and lengths 32K-127K).
 
-| depth | 0.0 | 0.05 | 0.1 | 0.15 | 0.25 | 0.5 | 0.6 | 0.9 |
-|---|---|---|---|---|---|---|---|---|
-| 127K | pass | **fail** | **fail** | pass | pass | pass | pass | pass |
+Getting there turned up a correctness bug worth stating on its own, because it
+is invisible to every short test. Needle recall was failing reproducibly at
+depths 0.05 and 0.1 for prompts of 32K and up -- returning a confident near-miss
+(`4831`, `6888`) rather than nothing. It looked like sparse-index or KDA
+state decay, and it was neither. **Flushing the radix cache before the identical
+request makes it pass.**
 
-The failures are reproducible, not flaky -- depth 0.1 fails on three separate
-runs at temperature 0, returning a plausible near-miss (`4831` for
-`4817-QUARTZ-9930`) rather than nothing. Holding depth at 0.1 and sweeping
-length puts the onset between 16K and 32K:
+`bench/test_prefix_cache.py` isolates it to one variable. Same tokens, same
+greedy decode, same server; the only difference is whether the request hits a
+cached prefix:
 
-| length @ depth 0.1 | 16K | 32K | 64K | 127K |
-|---|---|---|---|---|
-| | pass | **fail** | **fail** | **fail** |
+```
+depth=0.05: cold=ok warm=BAD identical=False
+  cold: '4817-QUARTZ-9930...'
+  warm: '6888...'
+```
 
-So it is neither a pure fraction nor a pure absolute-position effect: 19K tokens
-deep at 127K (depth 0.15) is recalled while 13K deep (depth 0.1) is not, and the
-very first tokens always survive. That shape -- beginning retained, a band just
-after it lost, everything later retained -- is what a sparse index that always
-keeps the attention sink and the recent window looks like, but it is equally
-consistent with the 34 KDA layers' recurrent state. Which of the two, or whether
-the NoPE reference contributes, is not yet isolated; it needs a comparison
-against the same checkpoint on hardware where the vendor kernels run.
+GLM-5.3 is hybrid, so a prefix hit has to restore two things at the match point:
+paged KV for the 11 MLA layers and a recurrent state for the 34 KDA layers. The
+KV half is exact. The recurrent half is not, so a cache hit resumes from a state
+that does not correspond to the tokens it is credited with -- and the model
+answers fluently from it, which is why this reads as a model quality problem
+rather than a cache bug. It reproduces on `extra_buffer` and
+`extra_buffer_lazy` alike, and depends on the *match length* rather than the
+needle position, which is why the failures looked like a band: at depth 0 there
+is nothing cached to match, and past ~0.15 the match lands somewhere benign.
 
-Two things had to change to get here. GLM-5.3 splits one memory budget between 34 KDA
+`--disable-radix-cache` is the fix, and it is what `tp8_sm120mla` now sets.
+Prefix reuse is a real loss for multi-turn and shared-prefix serving; a wrong
+answer is a worse one.
+
+Two things had to change for the memory to be there. GLM-5.3 splits one budget between 34 KDA
 layers' recurrent state and 11 MLA layers' paged KV; `--mamba-full-memory-ratio`
 defaults to 0.9, which reserves most of it for KDA state and buys concurrency
 nobody asked for on a box like this. At 0.25 the KV pool goes from 127,296 to
@@ -176,8 +185,8 @@ since an 8-way all-reduce moves `2(N-1)/N` of the data through shared host memor
   version worth writing.
 - Long greedy decodes show phrase-level repetition. Short answers, facts,
   arithmetic and chain-of-thought are correct.
-- A reproducible recall gap sits ~5-10% into contexts of 32K and above; see
-  **Long context**. Unattributed as yet.
+- Prefix caching is off, because a cache hit corrupts the KDA recurrent state;
+  see **Long context**. Multi-turn and shared-prefix workloads pay full prefill.
 - Prefill is chunked at 2048, so a full 128K prompt costs ~110 s before the
   first token. Trading KV back for KDA state raises concurrency and lowers it.
 - Communication caps this box near 105 tok/s regardless of kernel work.
@@ -198,6 +207,11 @@ Worth reporting to sgl-project/sglang regardless of hardware:
    ignore list is never rewritten and startup fails on any hardware.
 5. `_resolve_kpool_tail_backend` tests `device_sm_major >= 10` and routes sm120
    to an sm100-only backend.
+6. A radix-cache prefix hit silently corrupts the KDA recurrent state on
+   `glm5_next`: the same prompt answers correctly on a cold cache and wrongly on
+   a hit, on both `extra_buffer` and `extra_buffer_lazy`. Silent, and only
+   reachable with prompts long enough to build a substantial cached prefix.
+   Reproducer: `bench/test_prefix_cache.py`.
 
 ## Tests
 
@@ -210,4 +224,5 @@ Worth reporting to sgl-project/sglang regardless of hardware:
 | `bench/test_sparse_attn.py` | sparse attention vs fp32 reference |
 | `bench/test_sparse_attn_chunked.py` | row slicing vs a single pass (fp-reassociation bound) |
 | `bench/test_long_context.py` | needle-in-a-haystack at 128K |
+| `bench/test_prefix_cache.py` | cache-hit answer vs cold-cache answer |
 | `bench/pcie_allreduce.py` | all-reduce strategies vs NCCL |

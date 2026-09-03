@@ -13,6 +13,7 @@ separate region at the end of each page.
 
 import logging
 import math
+import os
 from typing import Optional
 
 import torch
@@ -242,6 +243,39 @@ def _sparse_attend_rows(
     out = out.masked_fill(lonely.unsqueeze(-1), 0.0)
 
     return out.to(torch.bfloat16), lse
+
+
+_PROBE_INDEX_LAYOUT = os.environ.get("SGLANG_SM120_PROBE_INDEX") == "1"
+_probe_seen = 0
+
+
+def _probe_index_layout(indices):
+    """Report whether valid index entries are packed at the front of each row.
+
+    topk_lengths masks positions past the count of non-negative entries, which is
+    only equivalent to masking -1 when the valid entries are contiguous. If they
+    are not, that mask drops real keys off the tail of long rows.
+    """
+    global _probe_seen
+    if _probe_seen >= 6:
+        return
+    _probe_seen += 1
+    rows = indices.reshape(-1, indices.shape[-1])
+    valid = rows >= 0
+    counts = valid.sum(-1)
+    # Packed <=> the last valid position in a row is exactly count-1.
+    pos = torch.arange(rows.shape[-1], device=rows.device).expand_as(rows)
+    last_valid = torch.where(valid, pos, torch.full_like(pos, -1)).amax(-1)
+    packed = (last_valid == counts - 1) | (counts == 0)
+    holes = (counts - 1 - last_valid).abs()
+    print(
+        f"[probe] rows={rows.shape[0]} topk={rows.shape[-1]} "
+        f"count[min/med/max]={int(counts.min())}/{int(counts.median())}/{int(counts.max())} "
+        f"packed_rows={int(packed.sum())}/{rows.shape[0]} "
+        f"max_tail_gap={int(holes.max())} "
+        f"maxidx={int(rows.max())}",
+        flush=True,
+    )
 
 
 def _sm120_sparse_decode_fwd(
@@ -755,6 +789,8 @@ def flashinfer_sparse_mla_forward(
         # bounds it. (Measured: 190 valid entries for a 19-token prefill, exactly
         # the causal count, so valid entries are packed at the front.)
         topk_lengths = (indices >= 0).sum(dim=-1).to(torch.int32)
+        if _PROBE_INDEX_LAYOUT:
+            _probe_index_layout(indices)
         out, _ = _sm120_sparse_decode_fwd(
             q.unsqueeze(1),
             kv_cache,

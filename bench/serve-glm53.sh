@@ -128,7 +128,16 @@ case "$MODE" in
                       # one budget. The 0.9 default reserves most of it for KDA
                       # state -- 43 concurrent sequences -- which starves KV and
                       # caps context. This box serves few streams and long ones.
-                      --mamba-full-memory-ratio 0.25) ;;
+                      --mamba-full-memory-ratio 0.25
+                      # Reusing a cached prefix returns a wrong answer on this
+                      # model: a needle 5-10% into a >=32K prompt is recalled
+                      # only when the request misses the radix cache. Flushing
+                      # the cache first makes the identical prompt pass, so the
+                      # KV is fine and the KDA recurrent state restored at the
+                      # match point is not. bench/test_prefix_cache.py is the
+                      # reproducer. Correctness over prefix reuse until the
+                      # state handoff is fixed upstream.
+                      --disable-radix-cache) ;;
   tp8_tilelang)
                export SGLANG_ENABLE_JIT_DEEPGEMM=0
                # bfloat16 must be explicit: `auto` resolves to fp8_e4m3 on Blackwell,
@@ -142,4 +151,6 @@ esac
 source "$VENV/bin/activate"
 mkdir -p /root/logs
 echo "=== serving mode=$MODE ==="
-exec python -m sglang.launch_server "${COMMON[@]}" "${EXTRA[@]}" 2>&1 | tee "/root/logs/serve_${MODE}.log"
+# EXTRA_ARGS appends server flags for one-off experiments without editing a mode.
+read -r -a _extra_args <<< "${EXTRA_ARGS:-}"
+exec python -m sglang.launch_server "${COMMON[@]}" "${EXTRA[@]}" "${_extra_args[@]}" 2>&1 | tee "/root/logs/serve_${MODE}.log"
