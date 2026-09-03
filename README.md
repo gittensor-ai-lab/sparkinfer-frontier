@@ -131,6 +131,20 @@ is nothing cached to match, and past ~0.15 the match lands somewhere benign.
 Prefix reuse is a real loss for multi-turn and shared-prefix serving; a wrong
 answer is a worse one.
 
+Every reachable way of keeping it was tried first, and all of them lose the
+needle on a cache hit while the cold run recalls it:
+
+| strategy | |
+|---|---|
+| `extra_buffer` (default) | **fail** -- warm `6888` |
+| `extra_buffer_lazy` | **fail** -- warm `6888` |
+| `--mamba-max-states-per-path 1` | **fail** -- warm `48` |
+| `--enable-hierarchical-cache` | **fail** -- warm `4830` |
+| `no_buffer` | unreachable: needs `page_size=1`, and `dsa_backend.py:1323` requires `page_size == 64` for the kpool path |
+
+So this is not a tuning problem. Prefix reuse for `glm5_next` needs the state
+handoff fixed upstream.
+
 Two things had to change for the memory to be there. GLM-5.3 splits one budget between 34 KDA
 layers' recurrent state and 11 MLA layers' paged KV; `--mamba-full-memory-ratio`
 defaults to 0.9, which reserves most of it for KDA state and buys concurrency
@@ -273,9 +287,12 @@ Worth reporting to sgl-project/sglang regardless of hardware:
    to an sm100-only backend.
 6. A radix-cache prefix hit silently corrupts the KDA recurrent state on
    `glm5_next`: the same prompt answers correctly on a cold cache and wrongly on
-   a hit, on both `extra_buffer` and `extra_buffer_lazy`. Silent, and only
-   reachable with prompts long enough to build a substantial cached prefix.
-   Reproducer: `bench/test_prefix_cache.py`.
+   a hit. Every reachable strategy fails -- `extra_buffer`,
+   `extra_buffer_lazy`, `--mamba-max-states-per-path 1` and
+   `--enable-hierarchical-cache` -- and `no_buffer` cannot be selected at all,
+   since it requires `page_size=1` while the DSA kpool path requires 64. Silent,
+   and only reachable with prompts long enough to build a substantial cached
+   prefix. Reproducer: `bench/test_prefix_cache.py`.
 
 ## Tests
 
