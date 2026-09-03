@@ -310,13 +310,13 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
 
         if self.use_sm120_ref:
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-            from sglang.srt.layers.quantization.compressed_tensors.sm120_nvfp4_moe_ref import (
-                sm120_nvfp4_moe_forward,
+            from sglang.srt.layers.quantization.compressed_tensors.sm120_nvfp4_moe_fused import (
+                sm120_nvfp4_moe_fused,
             )
 
             topk_weights, topk_ids, _ = dispatch_output.topk_output
             return StandardCombineInput(
-                hidden_states=sm120_nvfp4_moe_forward(
+                hidden_states=sm120_nvfp4_moe_fused(
                     x=x,
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,

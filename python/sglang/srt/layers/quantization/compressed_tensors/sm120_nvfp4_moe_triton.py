@@ -136,3 +136,116 @@ def nvfp4_gemm(
         num_warps=4, num_stages=3,
     )
     return out
+
+
+@triton.jit
+def _nvfp4_grouped_gemm_kernel(
+    a_ptr, wq_ptr, ws_ptr, gs_ptr, out_ptr,
+    sorted_ids_ptr, expert_ids_ptr, num_valid_ptr,
+    N, K, top_k, num_rows,
+    stride_am, stride_ak,
+    stride_we, stride_wn, stride_wk,
+    stride_se, stride_sn, stride_sk,
+    stride_om, stride_on,
+    lut_ptr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP: tl.constexpr,
+):
+    """One launch for every routed (token, expert) pair.
+
+    Rows are the expert-sorted order from moe_align_block_size, so a block owns
+    BLOCK_M consecutive rows that all share one expert -- read from expert_ids
+    rather than looped over on the host.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    num_valid = tl.load(num_valid_ptr)
+    if pid_m * BLOCK_M >= num_valid:
+        return
+
+    offs_sorted = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    row = tl.load(sorted_ids_ptr + offs_sorted, mask=offs_sorted < num_valid, other=0)
+    # Padded slots point past the real rows; mask them out of both load and store.
+    row_ok = (offs_sorted < num_valid) & (row < num_rows * top_k)
+    a_row = row // top_k
+
+    expert = tl.load(expert_ids_ptr + pid_m)
+    wq_e = wq_ptr + expert * stride_we
+    ws_e = ws_ptr + expert * stride_se
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        a = tl.load(
+            a_ptr + a_row[:, None] * stride_am + offs_k[None, :] * stride_ak,
+            mask=row_ok[:, None] & (offs_k[None, :] < K),
+            other=0.0,
+        )
+
+        offs_b = (k0 // 2) + tl.arange(0, BLOCK_K // 2)
+        packed = tl.load(
+            wq_e + offs_n[:, None] * stride_wn + offs_b[None, :] * stride_wk,
+            mask=(offs_n[:, None] < N) & (offs_b[None, :] < K // 2),
+            other=0,
+        ).to(tl.int32)
+        nib = tl.interleave(packed & 0xF, (packed >> 4) & 0xF)
+        mag = tl.load(lut_ptr + (nib & 0x7).reshape(BLOCK_N * BLOCK_K)).reshape(
+            BLOCK_N, BLOCK_K
+        )
+        w = tl.where((nib & 0x8) != 0, -mag, mag)
+
+        offs_g = (k0 // GROUP) + tl.arange(0, BLOCK_K // GROUP)
+        scales = tl.load(
+            ws_e + offs_n[:, None] * stride_sn + offs_g[None, :] * stride_sk,
+            mask=(offs_n[:, None] < N) & (offs_g[None, :] < K // GROUP),
+            other=0.0,
+        ).to(tl.float32)
+        w = w * tl.reshape(
+            tl.broadcast_to(scales[:, :, None], (BLOCK_N, BLOCK_K // GROUP, GROUP)),
+            (BLOCK_N, BLOCK_K),
+        )
+
+        acc += tl.dot(a, tl.trans(w.to(tl.bfloat16)).to(a.dtype), allow_tf32=True)
+
+    acc = acc * tl.load(gs_ptr + expert)
+    tl.store(
+        out_ptr + offs_sorted[:, None] * stride_om + offs_n[None, :] * stride_on,
+        acc.to(tl.bfloat16),
+        mask=row_ok[:, None] & (offs_n[None, :] < N),
+    )
+
+
+def nvfp4_grouped_gemm(
+    a: torch.Tensor,
+    wq: torch.Tensor,
+    ws: torch.Tensor,
+    gs: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_valid: torch.Tensor,
+    top_k: int,
+    block_m: int,
+) -> torch.Tensor:
+    """Grouped NVFP4 GEMM over expert-sorted rows -> [len(sorted_ids), N]."""
+    num_rows, K = a.shape
+    N = wq.shape[1]
+    out = torch.zeros(
+        (sorted_ids.shape[0], N), dtype=torch.bfloat16, device=a.device
+    )
+    grid = (triton.cdiv(sorted_ids.shape[0], block_m), triton.cdiv(N, 64))
+    _nvfp4_grouped_gemm_kernel[grid](
+        a, wq, ws, gs, out,
+        sorted_ids, expert_ids, num_valid,
+        N, K, top_k, num_rows,
+        a.stride(0), a.stride(1),
+        wq.stride(0), wq.stride(1), wq.stride(2),
+        ws.stride(0), ws.stride(1), ws.stride(2),
+        out.stride(0), out.stride(1),
+        _lut(a.device),
+        BLOCK_M=block_m, BLOCK_N=64, BLOCK_K=64, GROUP=_GROUP,
+        num_warps=4, num_stages=3,
+    )
+    return out

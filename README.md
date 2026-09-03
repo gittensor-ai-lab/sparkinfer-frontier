@@ -68,8 +68,25 @@ and applies the per-group FP8 scale inside the matmul, so expert weights are rea
 once at 4 bits and never materialised in bfloat16. Tiles are 64x64x64, sized for
 sm120's 99 KB of shared memory rather than sm100's 228 KB.
 
-Against `dequantize_nvfp4` + `torch.matmul` on identical packed weights
-(`bench/test_nvfp4_gemm.py`):
+`sm120_nvfp4_moe_fused.py` then removes the per-expert launch: `moe_align_block_size`
+sorts the routed (token, expert) pairs so a block owns 64 rows sharing one expert,
+and the whole MoE becomes **two grouped GEMMs** instead of two launches per expert.
+
+Against the per-expert reference at GLM-5.3 shapes, 288 experts / top-8
+(`bench/test_moe_fused.py`), matching it exactly:
+
+| tokens | experts hit | reference | fused | |
+|---|---|---|---|---|
+| 1 | 8 | 3.84 ms | 0.65 ms | **5.9x** |
+| 8 | 62 | 28.23 ms | 0.87 ms | **32.5x** |
+| 32 | 166 | 75.57 ms | 1.66 ms | **45.4x** |
+| 128 | 280 | 129.16 ms | 2.50 ms | **51.7x** |
+
+End to end that is **2.5 -> 6.0 tok/s** (16 tokens in 2.65 s, warm; the first
+request pays Triton JIT).
+
+The single GEMM underneath (`bench/test_nvfp4_gemm.py`), against
+`dequantize_nvfp4` + `torch.matmul` on identical packed weights:
 
 | M | N | K | rel err | dequant+matmul | fused | |
 |---|---|---|---|---|---|---|
@@ -83,10 +100,10 @@ a Python float syncs once per expert, roughly 90 times per layer.
 
 ## Known limitations
 
-- End to end is **2.5 tok/s** (16 tokens in 6.4 s). The fused GEMM is in, but the
-  MoE still loops over experts in Python, one kernel launch each, with CUDA
-  graphs off. **Batching the routed experts into a single grouped GEMM is the
-  next win**, worth far more than the GEMM itself.
+- End to end is **6.0 tok/s** (16 tokens in 2.65 s, warm). CUDA graphs are still
+  off because the NoPE attention reference does a host sync, and attention is
+  unfused. **A capturable attention path is the next win** now that the MoE is
+  grouped.
 - Long greedy decodes still show phrase-level repetition. Short answers, facts,
   arithmetic and chain-of-thought are correct.
 - Communication costs ~106 us for an 8 KiB all-reduce and 3.3 GB/s at 64 MiB,
