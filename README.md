@@ -1,4 +1,4 @@
-# Frontier models on 8x RTX 5090
+# SparkInfer Frontier
 
 **GLM-5.3-Flash (NVFP4)** — 320B total, 18B active — serving on eight consumer
 RTX 5090s. No datacenter GPU, no NVLink, no P2P. A fork of
