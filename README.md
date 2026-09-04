@@ -1,5 +1,7 @@
 # SparkInfer Frontier
 
+![GLM-5.3-Flash on 8x RTX 5090](docs/images/glm53-flash-banner.png)
+
 **GLM-5.3-Flash (NVFP4)** — 320B total, 18B active — serving on eight consumer
 RTX 5090s. No datacenter GPU, no NVLink, no P2P. A fork of
 [SGLang](https://github.com/sgl-project/sglang).
